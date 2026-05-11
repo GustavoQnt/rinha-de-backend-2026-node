@@ -1,3 +1,6 @@
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::env;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -10,12 +13,12 @@ use std::thread;
 use std::time::Duration;
 
 use rinha_server::{
-    ivf::Ivf, ivf_blocks::IvfBlocks, json, knn, refs::Refs, response::Responses, vectorize,
+    ivf::Ivf, ivf_blocks::IvfBlocks, json, knn, refs::Refs, response::Responses,
+    server::{Index, MAX_BODY, MAX_HEAD},
+    vectorize,
 };
 
 const READ_BUF: usize = 16 * 1024;
-const MAX_HEAD: usize = 16 * 1024;
-const MAX_BODY: usize = 64 * 1024;
 const DEFAULT_IVF_NPROBE: usize = 64;
 #[cfg(unix)]
 const DEFAULT_APP_WORKERS: usize = 4;
@@ -93,29 +96,6 @@ fn wants_close(request_line: &[u8], headers: &[u8]) -> bool {
         return true;
     }
     false
-}
-
-struct Index {
-    refs: Option<Refs>,
-    ivf: Option<Ivf>,
-    ivf_blocks: Option<IvfBlocks>,
-    nprobe: usize,
-    two_pass: Option<(usize, usize)>,
-}
-
-impl Index {
-    fn predict(&self, v: &[f64; 14]) -> u8 {
-        if let Some(blocks) = &self.ivf_blocks {
-            if let Some((fast, full)) = self.two_pass {
-                return knn::predict_bucket_ivf_blocks_two_pass(blocks, v, fast, full);
-            }
-            return knn::predict_bucket_ivf_blocks(blocks, v, self.nprobe);
-        }
-        match &self.ivf {
-            Some(ivf) => knn::predict_bucket_ivf(ivf, v, self.nprobe),
-            None => knn::predict_bucket(self.refs.as_ref().expect("refs loaded"), v),
-        }
-    }
 }
 
 fn handle_http<S: Read + Write>(mut stream: S, index: Arc<Index>, responses: Arc<Responses>) {
@@ -364,6 +344,13 @@ fn main() {
     let index = Arc::new(Index { refs, ivf, ivf_blocks, nprobe, two_pass });
     let responses = Arc::new(Responses::build());
     eprintln!("distance kernel = {}", knn::active_distance_kernel_name());
+
+    #[cfg(target_os = "linux")]
+    if env::var("USE_MONOIO").as_deref() == Ok("1") {
+        eprintln!("server backend = monoio (io_uring)");
+        rinha_server::monoio_server::serve_monoio(port, index, responses);
+        return;
+    }
 
     #[cfg(unix)]
     if let Ok(sock_path) = env::var("SOCK_PATH") {

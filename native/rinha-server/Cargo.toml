@@ -3,6 +3,12 @@ name = "rinha_server"
 version = "0.1.0"
 edition = "2021"
 
+[dependencies]
+mimalloc = { version = "0.1", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+monoio = { version = "0.2", default-features = false, features = ["iouring", "legacy", "macros"] }
+
 [lib]
 name = "rinha_server"
 path = "src/lib.rs"

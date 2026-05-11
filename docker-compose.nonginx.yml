@@ -9,9 +9,14 @@ services:
       APP_WORKERS: "${APP_WORKERS:-16}"
       PORT: "9999"
       SOCK_PATH: ""
+      USE_MONOIO: "${USE_MONOIO:-0}"
       RINHA_USE_AVX2: "1"
     ports:
       - "9999:9999"
+    security_opt:
+      - seccomp=unconfined
+    ulimits:
+      memlock: -1
     deploy:
       resources:
         limits:
