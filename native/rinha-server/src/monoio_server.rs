@@ -13,6 +13,7 @@ use std::marker::PhantomData;
 
 use monoio::buf::IoBuf;
 use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
+use monoio::net::unix::{UnixListener, UnixStream};
 use monoio::net::{ListenerOpts, TcpListener, TcpStream};
 use monoio::RuntimeBuilder;
 
@@ -21,7 +22,12 @@ use crate::{json, response::Responses, vectorize};
 
 const READ_BUF: usize = 128 * 1024;
 
-pub fn serve_monoio(port: u16, index: Arc<Index>, responses: Arc<Responses>) {
+pub fn serve_monoio(
+    port: u16,
+    sock_path: Option<String>,
+    index: Arc<Index>,
+    responses: Arc<Responses>,
+) {
     // Leak the Arcs to obtain `'static` references. The server runs until
     // process exit, so this is the natural lifetime for these singletons and
     // avoids per-task `Arc::clone` syscalls in the hot path.
@@ -32,15 +38,27 @@ pub fn serve_monoio(port: u16, index: Arc<Index>, responses: Arc<Responses>) {
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n > 0)
-        .unwrap_or_else(|| num_cpus_or_default());
+        .unwrap_or_else(num_cpus_or_default);
     eprintln!("monoio: thread-per-core workers = {workers}");
+
+    let sock_path = sock_path.filter(|p| !p.is_empty());
+    if let Some(ref path) = sock_path {
+        let _ = std::fs::remove_file(path);
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+    }
 
     let mut handles = Vec::with_capacity(workers);
     for worker_id in 0..workers {
+        let path = sock_path.clone();
         handles.push(
             thread::Builder::new()
                 .name(format!("monoio-{worker_id}"))
-                .spawn(move || worker_main(port, worker_id, index_ref, responses_ref))
+                .spawn(move || match path {
+                    Some(p) => worker_main_uds(p, worker_id, index_ref, responses_ref),
+                    None => worker_main_tcp(port, worker_id, index_ref, responses_ref),
+                })
                 .expect("spawn monoio worker"),
         );
     }
@@ -49,7 +67,12 @@ pub fn serve_monoio(port: u16, index: Arc<Index>, responses: Arc<Responses>) {
     }
 }
 
-fn worker_main(port: u16, worker_id: usize, index: &'static Index, responses: &'static Responses) {
+fn worker_main_tcp(
+    port: u16,
+    worker_id: usize,
+    index: &'static Index,
+    responses: &'static Responses,
+) {
     let mut rt = RuntimeBuilder::<monoio::IoUringDriver>::new()
         .with_entries(1024)
         .enable_timer()
@@ -68,7 +91,68 @@ fn worker_main(port: u16, worker_id: usize, index: &'static Index, responses: &'
                 Ok((stream, _)) => {
                     monoio::spawn(async move {
                         let _ = stream.set_nodelay(true);
-                        handle_conn(stream, index, responses).await;
+                        handle_conn_tcp(stream, index, responses).await;
+                    });
+                }
+                Err(err) => {
+                    eprintln!("accept error on worker {worker_id}: {err}");
+                    continue;
+                }
+            }
+        }
+    });
+}
+
+fn worker_main_uds(
+    sock_path: String,
+    worker_id: usize,
+    index: &'static Index,
+    responses: &'static Responses,
+) {
+    let mut rt = RuntimeBuilder::<monoio::IoUringDriver>::new()
+        .with_entries(1024)
+        .enable_timer()
+        .build()
+        .expect("build monoio runtime");
+
+    // Bind synchronously via std::os::unix::net (always works), then adopt
+    // into monoio. monoio's io_uring `UnixListener::bind` returns ENOTSUP on
+    // some kernels (notably Docker Desktop WSL2), so we sidestep that path.
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener as StdUnixListener;
+    let std_listener = match StdUnixListener::bind(&sock_path) {
+        Ok(l) => {
+            let _ = std::fs::set_permissions(
+                &sock_path,
+                std::fs::Permissions::from_mode(0o777),
+            );
+            Some(l)
+        }
+        Err(err) => {
+            eprintln!("monoio worker {worker_id} std bind {sock_path} failed: {err}");
+            None
+        }
+    };
+
+    rt.block_on(async move {
+        let listener = std_listener.and_then(|l| match UnixListener::from_std(l) {
+            Ok(m) => Some(m),
+            Err(err) => {
+                eprintln!("monoio worker {worker_id} from_std failed: {err}");
+                None
+            }
+        });
+        let Some(listener) = listener else {
+            std::future::pending::<()>().await;
+            unreachable!();
+        };
+        eprintln!("monoio worker {worker_id} listening on unix:{sock_path}");
+
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    monoio::spawn(async move {
+                        handle_conn_uds(stream, index, responses).await;
                     });
                 }
                 Err(err) => {
@@ -101,7 +185,18 @@ unsafe impl IoBuf for StaticBuf {
 
 // --- Connection handler ---------------------------------------------------
 
-async fn handle_conn(mut stream: TcpStream, index: &'static Index, responses: &'static Responses) {
+async fn handle_conn_tcp(stream: TcpStream, index: &'static Index, responses: &'static Responses) {
+    handle_conn(stream, index, responses).await;
+}
+
+async fn handle_conn_uds(stream: UnixStream, index: &'static Index, responses: &'static Responses) {
+    handle_conn(stream, index, responses).await;
+}
+
+async fn handle_conn<S>(mut stream: S, index: &'static Index, responses: &'static Responses)
+where
+    S: AsyncReadRent + AsyncWriteRentExt,
+{
     let mut buf: Vec<u8> = Vec::with_capacity(READ_BUF);
     let mut consumed: usize = 0;
 

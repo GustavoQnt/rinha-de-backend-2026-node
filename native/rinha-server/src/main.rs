@@ -347,8 +347,9 @@ fn main() {
 
     #[cfg(target_os = "linux")]
     if env::var("USE_MONOIO").as_deref() == Ok("1") {
+        let sock = env::var("SOCK_PATH").ok();
         eprintln!("server backend = monoio (io_uring)");
-        rinha_server::monoio_server::serve_monoio(port, index, responses);
+        rinha_server::monoio_server::serve_monoio(port, sock, index, responses);
         return;
     }
 
