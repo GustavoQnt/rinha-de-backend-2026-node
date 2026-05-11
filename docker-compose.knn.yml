@@ -1,0 +1,14 @@
+services:
+  api01:
+    environment:
+      CLASSIFIER: "knn-bin"
+      REFERENCES_BIN_PATH: "/app/resources/references.bin"
+    volumes:
+      - ./resources:/app/resources:ro
+
+  api02:
+    environment:
+      CLASSIFIER: "knn-bin"
+      REFERENCES_BIN_PATH: "/app/resources/references.bin"
+    volumes:
+      - ./resources:/app/resources:ro

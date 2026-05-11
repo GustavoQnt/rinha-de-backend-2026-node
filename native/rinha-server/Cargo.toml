@@ -1,0 +1,42 @@
+[package]
+name = "rinha_server"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "rinha_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rinha-server"
+path = "src/main.rs"
+
+[[bin]]
+name = "validate-ivf-parity"
+path = "src/bin/validate-ivf-parity.rs"
+
+[[bin]]
+name = "sweep-ivf-nprobe"
+path = "src/bin/sweep-ivf-nprobe.rs"
+
+[[bin]]
+name = "validate-avx2-ivf"
+path = "src/bin/validate-avx2-ivf.rs"
+
+[[bin]]
+name = "measure-nn-density"
+path = "src/bin/measure-nn-density.rs"
+
+[[bin]]
+name = "validate-blocks-parity"
+path = "src/bin/validate-blocks-parity.rs"
+
+[[bin]]
+name = "sweep-blocks-nprobe"
+path = "src/bin/sweep-blocks-nprobe.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "symbols"
+opt-level = 3

@@ -1,0 +1,13 @@
+.git
+node_modules
+test
+docs
+resources/*
+!resources/references.ivf.bin
+!resources/references.ivf-blocks.bin
+!resources/references.ivf-blocks-K4096.bin
+data-generator
+participants
+misc
+*.md
+test/results.json
