@@ -1,0 +1,10 @@
+{
+    "participants": ["Gustavo Quintela"],
+    "social": [
+        "https://github.com/GustavoQnt",
+        "https://www.linkedin.com/in/gustavo-quintela-064861226/"
+    ],
+    "source-code-repo": "https://github.com/GustavoQnt/rinha-de-backend-2026-node",
+    "stack": ["rust", "monoio", "nginx", "io_uring", "avx2"],
+    "open_to_work": false
+}
