@@ -1,6 +1,6 @@
 services:
   app1:
-    image: ghcr.io/gustavoqnt/rinha-2026-rust:scm
+    image: ghcr.io/gustavoqnt/gustavoqntsrv:latest
     hostname: app1
     environment:
       IVF_BLOCKS_PATH: "/app/resources/references.ivf-blocks-K4096.bin"
@@ -25,7 +25,7 @@ services:
           memory: "160MB"
 
   app2:
-    image: ghcr.io/gustavoqnt/rinha-2026-rust:scm
+    image: ghcr.io/gustavoqnt/gustavoqntsrv:latest
     hostname: app2
     environment:
       IVF_BLOCKS_PATH: "/app/resources/references.ivf-blocks-K4096.bin"
@@ -50,7 +50,7 @@ services:
           memory: "160MB"
 
   lb:
-    image: ghcr.io/gustavoqnt/rinha-2026-lb:latest
+    image: ghcr.io/gustavoqnt/gustavoqntlb:latest
     environment:
       PORT: "9999"
       UPSTREAMS: "/run/rinha/api1.sock.ctrl,/run/rinha/api2.sock.ctrl"
