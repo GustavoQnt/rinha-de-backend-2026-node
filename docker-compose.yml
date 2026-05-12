@@ -4,8 +4,8 @@ services:
     hostname: app1
     environment:
       IVF_BLOCKS_PATH: "/app/resources/references.ivf-blocks-K4096.bin"
-      IVF_FAST_NPROBE: "8"
-      IVF_FULL_NPROBE: "32"
+      IVF_FAST_NPROBE: "4"
+      IVF_FULL_NPROBE: "12"
       APP_WORKERS: "1"
       SOCK_PATH: /run/rinha/rinha1.sock
       USE_MONOIO: "1"
@@ -22,16 +22,16 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.40"
-          memory: "150MB"
+          cpus: "0.45"
+          memory: "160MB"
 
   app2:
     image: ghcr.io/gustavoqnt/rinha-2026-rust:latest
     hostname: app2
     environment:
       IVF_BLOCKS_PATH: "/app/resources/references.ivf-blocks-K4096.bin"
-      IVF_FAST_NPROBE: "8"
-      IVF_FULL_NPROBE: "32"
+      IVF_FAST_NPROBE: "4"
+      IVF_FULL_NPROBE: "12"
       APP_WORKERS: "1"
       SOCK_PATH: /run/rinha/rinha2.sock
       USE_MONOIO: "1"
@@ -48,13 +48,13 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.40"
-          memory: "150MB"
+          cpus: "0.45"
+          memory: "160MB"
 
   lb:
-    image: haproxy:2.9-alpine
+    image: nginx:1.27-alpine
     volumes:
-      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
       - rinha-sock:/run/rinha
     ports:
       - "9999:9999"
@@ -68,8 +68,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.20"
-          memory: "50MB"
+          cpus: "0.10"
+          memory: "30MB"
 
 volumes:
   rinha-sock:
