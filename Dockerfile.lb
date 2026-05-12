@@ -12,8 +12,8 @@ FROM gcr.io/distroless/cc-debian12
 
 LABEL org.opencontainers.image.source="https://github.com/GustavoQnt/rinha-de-backend-2026-node"
 LABEL org.opencontainers.image.authors="Gustavo Quintela <gustavoqnt@github>"
-LABEL org.opencontainers.image.title="rinha-2026-lb"
-LABEL org.opencontainers.image.description="Rinha de Backend 2026 — TCP load balancer that hands accepted fds to upstream workers via SCM_RIGHTS over UDS"
+LABEL org.opencontainers.image.title="gustavoqntlb"
+LABEL org.opencontainers.image.description="Rinha de Backend 2026 — TCP load balancer that hands accepted fds to upstream workers via SCM_RIGHTS over UDS, by GustavoQnt"
 LABEL org.opencontainers.image.licenses="MIT"
 
 COPY --from=builder /build/native/rinha-lb/target/release/rinha-lb /rinha-lb

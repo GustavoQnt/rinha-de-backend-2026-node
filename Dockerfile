@@ -11,8 +11,8 @@ FROM debian:bookworm-slim
 
 LABEL org.opencontainers.image.source="https://github.com/GustavoQnt/rinha-de-backend-2026-node"
 LABEL org.opencontainers.image.authors="Gustavo Quintela <gustavoqnt@github>"
-LABEL org.opencontainers.image.title="rinha-2026-rust"
-LABEL org.opencontainers.image.description="Rinha de Backend 2026 — Rust + monoio io_uring fraud-score server (IVF + AVX2 + SCM_RIGHTS)"
+LABEL org.opencontainers.image.title="gustavoqntsrv"
+LABEL org.opencontainers.image.description="Rinha de Backend 2026 — Rust + monoio io_uring fraud-score server (IVF + AVX2 + SCM_RIGHTS) by GustavoQnt"
 LABEL org.opencontainers.image.licenses="MIT"
 
 WORKDIR /app
