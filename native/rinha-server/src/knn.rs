@@ -6,6 +6,13 @@ use std::sync::OnceLock;
 
 pub const TOP_K: usize = 5;
 
+// Two-tier IVF nprobe values. Hardcoded as compile-time constants so the
+// constants inline through `predict_bucket_ivf_blocks_two_pass` and the
+// inner scan kernels — no env lookup, no parameter passing on the hot path.
+// Values empirically validated against the top submission (jairoblatt).
+pub const IVF_FAST_NPROBE: usize = 5;
+pub const IVF_FULL_NPROBE: usize = 24;
+
 #[inline(always)]
 pub fn quantize_query(query: &[f64; 14], scale: u32) -> [i16; DIM] {
     let scale = scale as f64;
@@ -634,21 +641,18 @@ pub fn predict_bucket_ivf_blocks(ivf: &IvfBlocks, query: &[f64; 14], nprobe: usi
     bucket_from_blocks_top5(ivf, &top)
 }
 
-pub fn predict_bucket_ivf_blocks_two_pass(
-    ivf: &IvfBlocks,
-    query: &[f64; 14],
-    fast_nprobe: usize,
-    full_nprobe: usize,
-) -> u8 {
+#[inline]
+pub fn predict_bucket_ivf_blocks_two_pass(ivf: &IvfBlocks, query: &[f64; 14]) -> u8 {
     let q = quantize_query(query, ivf.scale);
-    let top = ivf_blocks_top5(ivf, &q, fast_nprobe);
+    let top = ivf_blocks_top5(ivf, &q, IVF_FAST_NPROBE);
     let bucket = bucket_from_blocks_top5(ivf, &top);
-    // Escalate any non-extreme bucket: clear legit (0) and clear fraud (5)
-    // are fast-path; anything else (1..=4) re-scans at full nprobe.
-    if bucket == 0 || bucket == TOP_K as u8 {
+    // Only re-scan on the genuinely ambiguous buckets (2 or 3 fraud hits in
+    // the fast top-5). bucket ∈ {0,1} → confident legit; bucket ∈ {4,5} →
+    // confident fraud; both pay the fast nprobe only.
+    if bucket != 2 && bucket != 3 {
         return bucket;
     }
-    let top_full = ivf_blocks_top5(ivf, &q, full_nprobe);
+    let top_full = ivf_blocks_top5(ivf, &q, IVF_FULL_NPROBE);
     bucket_from_blocks_top5(ivf, &top_full)
 }
 
