@@ -51,10 +51,10 @@ services:
           cpus: "0.40"
           memory: "150MB"
 
-  nginx:
-    image: nginx:1.27-alpine
+  lb:
+    image: haproxy:2.9-alpine
     volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
       - rinha-sock:/run/rinha
     ports:
       - "9999:9999"
