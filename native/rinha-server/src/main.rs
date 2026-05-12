@@ -346,6 +346,14 @@ fn main() {
     eprintln!("distance kernel = {}", knn::active_distance_kernel_name());
 
     #[cfg(target_os = "linux")]
+    if env::var("USE_SCM").as_deref() == Ok("1") {
+        let sock = env::var("SOCK_PATH").expect("SOCK_PATH required for USE_SCM=1");
+        eprintln!("server backend = monoio + SCM_RIGHTS (io_uring)");
+        rinha_server::monoio_server::serve_scm(sock, index, responses);
+        return;
+    }
+
+    #[cfg(target_os = "linux")]
     if env::var("USE_MONOIO").as_deref() == Ok("1") {
         let sock = env::var("SOCK_PATH").ok();
         eprintln!("server backend = monoio (io_uring)");

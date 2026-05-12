@@ -17,6 +17,7 @@ use monoio::net::unix::{UnixListener, UnixStream};
 use monoio::net::{ListenerOpts, TcpListener, TcpStream};
 use monoio::RuntimeBuilder;
 
+use crate::scm_recv::{self, FdQueue};
 use crate::server::{Index, MAX_BODY, MAX_HEAD};
 use crate::{json, response::Responses, vectorize};
 
@@ -168,6 +169,77 @@ fn num_cpus_or_default() -> usize {
     thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
+}
+
+// ---- SCM_RIGHTS path -----------------------------------------------------
+//
+// Runs a single monoio runtime that consumes TCP file descriptors handed
+// over by the LB on `${sock_path}.ctrl`. No own TCP/UDS listener — the LB
+// owns the accept side and delegates each connection to us via SCM_RIGHTS.
+
+pub fn serve_scm(sock_path: String, index: Arc<Index>, responses: Arc<Responses>) {
+    use std::os::unix::io::FromRawFd;
+    use std::sync::Mutex;
+
+    let index_ref: &'static Index = unsafe { &*Arc::into_raw(index) };
+    let responses_ref: &'static Responses = unsafe { &*Arc::into_raw(responses) };
+
+    let ctrl_path = format!("{sock_path}.ctrl");
+
+    // socketpair used solely to wake the runtime when fds land in the queue.
+    let (notify_tx_std, notify_rx_std) =
+        std::os::unix::net::UnixStream::pair().expect("socketpair");
+    notify_rx_std
+        .set_nonblocking(true)
+        .expect("notify_rx nonblocking");
+    let notify_tx = Arc::new(notify_tx_std);
+
+    let queue: FdQueue = Arc::new(Mutex::new(Vec::new()));
+    {
+        let queue = queue.clone();
+        let notify_tx = notify_tx.clone();
+        thread::Builder::new()
+            .name("scm-ctrl".into())
+            .spawn(move || scm_recv::control_thread(ctrl_path, queue, notify_tx))
+            .expect("spawn scm ctrl thread");
+    }
+
+    let mut rt = RuntimeBuilder::<monoio::IoUringDriver>::new()
+        .with_entries(1024)
+        .enable_timer()
+        .build()
+        .expect("build monoio runtime");
+
+    rt.block_on(async move {
+        let mut notify_rx = monoio::net::UnixStream::from_std(notify_rx_std)
+            .expect("notify from_std");
+        let mut buf: Vec<u8> = vec![0u8; 64];
+
+        loop {
+            let (res, b) = notify_rx.read(buf).await;
+            buf = b;
+            match res {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {
+                    let drained: Vec<libc::c_int> =
+                        queue.lock().expect("queue poisoned").drain(..).collect();
+                    for fd in drained {
+                        let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+                        if std_stream.set_nonblocking(true).is_err() {
+                            continue;
+                        }
+                        match TcpStream::from_std(std_stream) {
+                            Ok(stream) => {
+                                let _ = stream.set_nodelay(true);
+                                monoio::spawn(handle_conn_tcp(stream, index_ref, responses_ref));
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                }
+            }
+        }
+    });
 }
 
 // --- Buffer wrappers for static and owned response payloads ---------------
