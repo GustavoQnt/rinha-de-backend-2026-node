@@ -5,7 +5,7 @@ services:
     environment:
       IVF_BLOCKS_PATH: "/app/resources/references.ivf-blocks-K4096.bin"
       IVF_FAST_NPROBE: "4"
-      IVF_FULL_NPROBE: "12"
+      IVF_FULL_NPROBE: "20"
       APP_WORKERS: "1"
       SOCK_PATH: /run/rinha/rinha1.sock
       USE_MONOIO: "1"
@@ -31,7 +31,7 @@ services:
     environment:
       IVF_BLOCKS_PATH: "/app/resources/references.ivf-blocks-K4096.bin"
       IVF_FAST_NPROBE: "4"
-      IVF_FULL_NPROBE: "12"
+      IVF_FULL_NPROBE: "20"
       APP_WORKERS: "1"
       SOCK_PATH: /run/rinha/rinha2.sock
       USE_MONOIO: "1"
