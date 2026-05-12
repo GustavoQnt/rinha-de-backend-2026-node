@@ -21,11 +21,7 @@ use crate::scm_recv::{self, FdQueue};
 use crate::server::{Index, MAX_BODY, MAX_HEAD};
 use crate::{json, response::Responses, vectorize};
 
-// Fixed 8KB rx buffer per connection. Payload is ~1KB JSON; this leaves
-// massive headroom and stays well inside L1 cache. The previous 128KB
-// value caused allocator pressure under burst load (memory limited to
-// 160M total per app, ~50M after index + binary + monoio overhead).
-const READ_BUF: usize = 8 * 1024;
+const READ_BUF: usize = 128 * 1024;
 
 pub fn serve_monoio(
     port: u16,
