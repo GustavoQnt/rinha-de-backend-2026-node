@@ -22,3 +22,6 @@ resources/*.json
 !resources/normalization.json
 !resources/example-payloads.json
 !resources/example-references.json
+
+package.json
+package-lock.json
