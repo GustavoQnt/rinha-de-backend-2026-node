@@ -1,5 +1,7 @@
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+// Default to the system allocator (glibc on Linux) instead of mimalloc.
+// With APP_WORKERS=1 (single-threaded monoio per container), mimalloc's
+// per-thread arenas buy nothing, and glibc + MALLOC_ARENA_MAX=1 gives more
+// predictable allocation patterns (lower p99 variance).
 
 use std::env;
 use std::io::{Read, Write};
