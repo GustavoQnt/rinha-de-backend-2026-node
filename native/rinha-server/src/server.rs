@@ -11,16 +11,15 @@ pub struct Index {
     pub ivf: Option<Ivf>,
     pub ivf_blocks: Option<IvfBlocks>,
     pub nprobe: usize,
-    pub two_pass: Option<(usize, usize)>,
 }
 
 impl Index {
+    #[inline]
     pub fn predict(&self, v: &[f64; 14]) -> u8 {
         if let Some(blocks) = &self.ivf_blocks {
-            if let Some((fast, full)) = self.two_pass {
-                return knn::predict_bucket_ivf_blocks_two_pass(blocks, v, fast, full);
-            }
-            return knn::predict_bucket_ivf_blocks(blocks, v, self.nprobe);
+            // Bbox repair is the default when blocks are loaded: provably
+            // exact recall, with most clusters pruned via L2² lower-bound.
+            return knn::predict_bucket_ivf_blocks_bbox_repair(blocks, v);
         }
         match &self.ivf {
             Some(ivf) => knn::predict_bucket_ivf(ivf, v, self.nprobe),

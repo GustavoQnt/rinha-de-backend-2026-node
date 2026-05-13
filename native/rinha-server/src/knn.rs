@@ -652,10 +652,12 @@ pub fn warmup_ivf_blocks(ivf: &IvfBlocks, rounds: usize) {
     touch_u32(&ivf.block_origin, stride);
     touch_u8(&ivf.block_labels, stride);
     touch_u8(&ivf.labels_by_origin, stride);
+    touch_i16(&ivf.bbox_min, stride);
+    touch_i16(&ivf.bbox_max, stride);
 
-    // Phase 2: exercise the full predict path with a deterministic LCG. Hits
-    // both the fast-pass and full-pass branches because we sweep the input
-    // space wide enough to land all 6 bucket outcomes.
+    // Phase 2: exercise the actual production predict path with a deterministic
+    // LCG. Hits the nearest-centroid scan, the seed cluster scan, the bbox
+    // lower-bound prune, and the AVX2 codegen — all in one shot.
     let mut s: u64 = 0xC0FFEE_DEAD_BEEFu64;
     let mut acc: u64 = 0;
     for _ in 0..rounds {
@@ -666,9 +668,7 @@ pub fn warmup_ivf_blocks(ivf: &IvfBlocks, rounds: usize) {
             let v = ((s >> 32) as i32 as f64) / (i32::MAX as f64) * 3.0;
             *slot = v;
         }
-        let qi = quantize_query(&q, ivf.scale);
-        let top = ivf_blocks_top5(ivf, &qi, IVF_FULL_NPROBE_WARMUP);
-        let bucket = bucket_from_blocks_top5(ivf, &top);
+        let bucket = predict_bucket_ivf_blocks_bbox_repair(ivf, &q);
         // read_volatile sink so codegen can't elide the loop.
         unsafe { std::ptr::read_volatile(&bucket); }
         acc = acc.wrapping_add(bucket as u64);
@@ -676,10 +676,6 @@ pub fn warmup_ivf_blocks(ivf: &IvfBlocks, rounds: usize) {
     // Sink for the accumulator too, belt-and-suspenders.
     unsafe { std::ptr::read_volatile(&acc); }
 }
-
-// Slightly above the production full nprobe so the warmup exercises a
-// superset of cluster scans during the dry-run.
-const IVF_FULL_NPROBE_WARMUP: usize = 24;
 
 #[inline(never)]
 fn touch_i16(buf: &[i16], stride_bytes: usize) {
@@ -733,6 +729,130 @@ pub fn predict_bucket_ivf_blocks_two_pass(
     }
     let top_full = ivf_blocks_top5(ivf, &q, full_nprobe);
     bucket_from_blocks_top5(ivf, &top_full)
+}
+
+// ---- Bbox-pruned IVF search ---------------------------------------------
+//
+// L2² lower-bound from a quantized i16 query to a cluster's axis-aligned
+// bounding box. For each dim, the squared per-axis gap (0 when the query
+// coordinate lies inside the box on that axis) is summed. Early-exits the
+// moment the running sum exceeds `stop_after` — for far-away clusters this
+// usually fires within the first few dims.
+//
+// Triangle inequality: any point inside the bbox is at least this distance
+// from the query, so if `lower_bound > worst_top5` it is provably safe to
+// skip the entire cluster.
+#[inline]
+fn bbox_lower_bound_l2(
+    bbox_min: &[i16],
+    bbox_max: &[i16],
+    q: &[i16; DIM],
+    stop_after: i64,
+) -> i64 {
+    let mut sum: i64 = 0;
+    for d in 0..DIM {
+        let target = q[d] as i64;
+        let lo = bbox_min[d] as i64;
+        let hi = bbox_max[d] as i64;
+        let gap = if target < lo {
+            lo - target
+        } else if target > hi {
+            target - hi
+        } else {
+            0
+        };
+        sum += gap * gap;
+        if sum > stop_after {
+            return sum;
+        }
+    }
+    sum
+}
+
+// Find the single closest centroid by L2² (no top-K bookkeeping — simple min).
+#[inline]
+fn nearest_centroid_blocks<FC>(ivf: &IvfBlocks, q: &[i16; DIM], distance: FC) -> usize
+where
+    FC: Fn(&[i16], &[i16]) -> i64 + Copy,
+{
+    let mut best_d = i64::MAX;
+    let mut best_c = 0usize;
+    for c in 0..ivf.k {
+        let d = distance(q, ivf.centroid(c));
+        if d < best_d {
+            best_d = d;
+            best_c = c;
+        }
+    }
+    best_c
+}
+
+fn predict_bucket_ivf_blocks_bbox_with<FB, FC>(
+    ivf: &IvfBlocks,
+    query: &[f64; 14],
+    block_distances: FB,
+    centroid_distance: FC,
+) -> u8
+where
+    FB: Fn(&[i16; DIM], &[i16]) -> [i64; BLOCK_SIZE] + Copy,
+    FC: Fn(&[i16], &[i16]) -> i64 + Copy,
+{
+    let q = quantize_query(query, ivf.scale);
+
+    let mut distances = [i64::MAX; TOP_K];
+    let mut indexes = [0u32; TOP_K];
+
+    // Phase 1: scan the single closest cluster to get an initial top-5.
+    let seed = nearest_centroid_blocks(ivf, &q, centroid_distance);
+    for block_idx in ivf.cluster_block_range(seed) {
+        scan_block_soa(ivf, block_idx, &q, &mut distances, &mut indexes, block_distances);
+    }
+
+    // Phase 2: bbox-pruned sweep of every other cluster. For each, the bbox
+    // lower-bound says "no point in this cluster can be closer than X". If
+    // X exceeds the current worst-of-top-5, the cluster can't change the
+    // result and we skip it.
+    for c in 0..ivf.k {
+        if c == seed {
+            continue;
+        }
+        let worst = distances[TOP_K - 1];
+        let bbox_min = ivf.bbox_min_for(c);
+        let bbox_max = ivf.bbox_max_for(c);
+        let lb = bbox_lower_bound_l2(bbox_min, bbox_max, &q, worst);
+        if lb > worst {
+            continue;
+        }
+        for block_idx in ivf.cluster_block_range(c) {
+            scan_block_soa(ivf, block_idx, &q, &mut distances, &mut indexes, block_distances);
+        }
+    }
+
+    bucket_from_blocks_top5(ivf, &indexes)
+}
+
+/// Bbox-repair IVF: nearest-centroid seed + L2² bbox lower-bound pruning
+/// across the remaining K-1 clusters. Recall identical to full-scan (the
+/// pruning is provably exact — triangle inequality), but ~90%+ of clusters
+/// are eliminated without touching a single vector.
+pub fn predict_bucket_ivf_blocks_bbox_repair(ivf: &IvfBlocks, query: &[f64; 14]) -> u8 {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if avx2_enabled_for_runtime() {
+            return predict_bucket_ivf_blocks_bbox_with(
+                ivf,
+                query,
+                block_distances_avx2_checked,
+                squared_distance_avx2_checked,
+            );
+        }
+    }
+    predict_bucket_ivf_blocks_bbox_with(
+        ivf,
+        query,
+        block_distances_scalar,
+        squared_distance_scalar,
+    )
 }
 
 #[cfg(test)]

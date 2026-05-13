@@ -327,21 +327,11 @@ fn main() {
         eprintln!("ivf nprobe = {nprobe}");
     }
 
-    let two_pass = match (
-        env::var("IVF_FAST_NPROBE").ok().and_then(|s| s.parse::<usize>().ok()),
-        env::var("IVF_FULL_NPROBE").ok().and_then(|s| s.parse::<usize>().ok()),
-    ) {
-        (Some(fast), Some(full)) if k_for_nprobe.is_some() => {
-            let k = k_for_nprobe.unwrap();
-            let fast = fast.min(k);
-            let full = full.min(k);
-            eprintln!("ivf two-pass: fast_nprobe={fast} full_nprobe={full}");
-            Some((fast, full))
-        }
-        _ => None,
-    };
+    if k_for_nprobe.is_some() {
+        eprintln!("ivf mode: bbox-repair (nearest centroid + L2 bbox prune)");
+    }
 
-    let index = Arc::new(Index { refs, ivf, ivf_blocks, nprobe, two_pass });
+    let index = Arc::new(Index { refs, ivf, ivf_blocks, nprobe });
     let responses = Arc::new(Responses::build());
     eprintln!("distance kernel = {}", knn::active_distance_kernel_name());
 

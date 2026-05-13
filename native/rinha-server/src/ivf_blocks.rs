@@ -24,6 +24,13 @@ pub struct IvfBlocks {
     pub block_origin: Vec<u32>,          // total_blocks × 8, u32::MAX for padding
     pub block_labels: Vec<u8>,           // total_blocks × 8, 0xFF for padding
     pub labels_by_origin: Vec<u8>,       // count
+    // Per-cluster axis-aligned bounding boxes over the cluster's actual vectors,
+    // in quantized i16 space. Each is K × DIM. Used for L2² lower-bound pruning:
+    // for any cluster, the closest vector in it is at least the distance from
+    // the query to the bbox. Empty clusters get sentinel bbox (i16::MAX, i16::MIN)
+    // so lower_bound() returns infinity and they get skipped.
+    pub bbox_min: Vec<i16>,              // K × DIM
+    pub bbox_max: Vec<i16>,              // K × DIM
 }
 
 unsafe impl Send for IvfBlocks {}
@@ -90,6 +97,13 @@ impl IvfBlocks {
         assert_eq!(block_offsets[0], 0);
         assert_eq!(block_offsets[k] as usize, total_blocks);
 
+        let (bbox_min, bbox_max) = compute_bboxes(
+            k,
+            &block_offsets,
+            &block_vectors,
+            &block_origin,
+        );
+
         IvfBlocks {
             k,
             count,
@@ -101,8 +115,67 @@ impl IvfBlocks {
             block_origin,
             block_labels,
             labels_by_origin,
+            bbox_min,
+            bbox_max,
         }
     }
+
+    /// Min corner of cluster `c`'s bounding box, in quantized i16 space.
+    #[inline(always)]
+    pub fn bbox_min_for(&self, c: usize) -> &[i16] {
+        &self.bbox_min[c * DIM..(c + 1) * DIM]
+    }
+
+    /// Max corner of cluster `c`'s bounding box, in quantized i16 space.
+    #[inline(always)]
+    pub fn bbox_max_for(&self, c: usize) -> &[i16] {
+        &self.bbox_max[c * DIM..(c + 1) * DIM]
+    }
+}
+
+/// Walk every non-padding slot in every block and aggregate per-cluster min/max
+/// per dimension. Empty clusters get sentinel bbox so their lower-bound is
+/// effectively infinity (i16::MAX for min, i16::MIN for max — `target < min`
+/// AND `target > max` are both true, leading to a large sum, but the loop also
+/// short-circuits on `block_count == 0` and just leaves the sentinel.
+fn compute_bboxes(
+    k: usize,
+    block_offsets: &[u32],
+    block_vectors: &[i16],
+    block_origin: &[u32],
+) -> (Vec<i16>, Vec<i16>) {
+    let mut bbox_min = vec![i16::MAX; k * DIM];
+    let mut bbox_max = vec![i16::MIN; k * DIM];
+
+    for c in 0..k {
+        let blocks = block_offsets[c] as usize..block_offsets[c + 1] as usize;
+        for block_idx in blocks {
+            let block = &block_vectors[block_idx * BLOCK_LANES..(block_idx + 1) * BLOCK_LANES];
+            let origins = &block_origin[block_idx * BLOCK_SIZE..(block_idx + 1) * BLOCK_SIZE];
+            for slot in 0..BLOCK_SIZE {
+                if origins[slot] == u32::MAX {
+                    continue;
+                }
+                for d in 0..DIM {
+                    // SoA-by-block layout: dim d, slot s -> offset d*8 + s.
+                    let v = block[d * BLOCK_SIZE + slot];
+                    let min_slot = &mut bbox_min[c * DIM + d];
+                    if v < *min_slot {
+                        *min_slot = v;
+                    }
+                    let max_slot = &mut bbox_max[c * DIM + d];
+                    if v > *max_slot {
+                        *max_slot = v;
+                    }
+                }
+            }
+        }
+    }
+
+    (bbox_min, bbox_max)
+}
+
+impl IvfBlocks {
 
     #[inline(always)]
     pub fn centroid(&self, c: usize) -> &[i16] {
