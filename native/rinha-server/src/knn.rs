@@ -634,6 +634,89 @@ pub fn predict_bucket_ivf_blocks(ivf: &IvfBlocks, query: &[f64; 14], nprobe: usi
     bucket_from_blocks_top5(ivf, &top)
 }
 
+// Warmup: forces all index pages resident in RAM, primes the AVX2 codegen
+// path / iCache / branch predictor, and exercises both the fast-pass and
+// escalation paths. Runs synchronously on the main thread before any listener
+// is bound. The early prévia run produced p99=13.71ms while a re-run of the
+// same binary scored p99=1.38ms — symptom of cold pages + cold predictor on
+// the first burst of real traffic. The rinha banca takes ~1s to ramp up,
+// which is not enough to absorb that cost.
+pub fn warmup_ivf_blocks(ivf: &IvfBlocks, rounds: usize) {
+    // Phase 1: page-touch every backing array at 4 KiB stride to force the
+    // kernel to populate the VMA before traffic arrives. read_volatile prevents
+    // the loop from being optimized away.
+    let stride = 4096;
+    touch_i16(&ivf.centroids, stride);
+    touch_i16(&ivf.block_vectors, stride);
+    touch_u32(&ivf.block_offsets, stride);
+    touch_u32(&ivf.block_origin, stride);
+    touch_u8(&ivf.block_labels, stride);
+    touch_u8(&ivf.labels_by_origin, stride);
+
+    // Phase 2: exercise the full predict path with a deterministic LCG. Hits
+    // both the fast-pass and full-pass branches because we sweep the input
+    // space wide enough to land all 6 bucket outcomes.
+    let mut s: u64 = 0xC0FFEE_DEAD_BEEFu64;
+    let mut acc: u64 = 0;
+    for _ in 0..rounds {
+        let mut q = [0f64; 14];
+        for slot in &mut q {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            // map upper 32 bits to roughly [-3, 3], the scale of a quantized feature
+            let v = ((s >> 32) as i32 as f64) / (i32::MAX as f64) * 3.0;
+            *slot = v;
+        }
+        let qi = quantize_query(&q, ivf.scale);
+        let top = ivf_blocks_top5(ivf, &qi, IVF_FULL_NPROBE_WARMUP);
+        let bucket = bucket_from_blocks_top5(ivf, &top);
+        // read_volatile sink so codegen can't elide the loop.
+        unsafe { std::ptr::read_volatile(&bucket); }
+        acc = acc.wrapping_add(bucket as u64);
+    }
+    // Sink for the accumulator too, belt-and-suspenders.
+    unsafe { std::ptr::read_volatile(&acc); }
+}
+
+// Slightly above the production full nprobe so the warmup exercises a
+// superset of cluster scans during the dry-run.
+const IVF_FULL_NPROBE_WARMUP: usize = 24;
+
+#[inline(never)]
+fn touch_i16(buf: &[i16], stride_bytes: usize) {
+    let step = (stride_bytes / std::mem::size_of::<i16>()).max(1);
+    let mut sink: i16 = 0;
+    let mut i = 0;
+    while i < buf.len() {
+        sink ^= unsafe { std::ptr::read_volatile(&buf[i]) };
+        i += step;
+    }
+    unsafe { std::ptr::read_volatile(&sink); }
+}
+
+#[inline(never)]
+fn touch_u32(buf: &[u32], stride_bytes: usize) {
+    let step = (stride_bytes / std::mem::size_of::<u32>()).max(1);
+    let mut sink: u32 = 0;
+    let mut i = 0;
+    while i < buf.len() {
+        sink ^= unsafe { std::ptr::read_volatile(&buf[i]) };
+        i += step;
+    }
+    unsafe { std::ptr::read_volatile(&sink); }
+}
+
+#[inline(never)]
+fn touch_u8(buf: &[u8], stride_bytes: usize) {
+    let step = stride_bytes.max(1);
+    let mut sink: u8 = 0;
+    let mut i = 0;
+    while i < buf.len() {
+        sink ^= unsafe { std::ptr::read_volatile(&buf[i]) };
+        i += step;
+    }
+    unsafe { std::ptr::read_volatile(&sink); }
+}
+
 pub fn predict_bucket_ivf_blocks_two_pass(
     ivf: &IvfBlocks,
     query: &[f64; 14],

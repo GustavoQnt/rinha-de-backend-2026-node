@@ -345,6 +345,22 @@ fn main() {
     let responses = Arc::new(Responses::build());
     eprintln!("distance kernel = {}", knn::active_distance_kernel_name());
 
+    // Warmup before bind: page-touch the index + dry-run predict to prime
+    // iCache, dCache, and branch predictor. Eliminates the cold-start spike
+    // that produced p99=13.71ms on the first prévia run of this binary.
+    let warmup_rounds: usize = env::var("WARMUP_ROUNDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1500);
+    if let Some(blocks) = index.ivf_blocks.as_ref() {
+        let t0 = std::time::Instant::now();
+        knn::warmup_ivf_blocks(blocks, warmup_rounds);
+        eprintln!(
+            "warmup: {warmup_rounds} predict rounds + page-touch in {:?}",
+            t0.elapsed()
+        );
+    }
+
     #[cfg(target_os = "linux")]
     if env::var("USE_SCM").as_deref() == Ok("1") {
         let sock = env::var("SOCK_PATH").expect("SOCK_PATH required for USE_SCM=1");
