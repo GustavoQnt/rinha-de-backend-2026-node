@@ -224,6 +224,18 @@ pub fn serve_scm(sock_path: String, index: Arc<Index>, responses: Arc<Responses>
                     let drained: Vec<libc::c_int> =
                         queue.lock().expect("queue poisoned").drain(..).collect();
                     for fd in drained {
+                        // Bump SO_SNDBUF so write_all doesn't block on a small
+                        // kernel send buffer when many connections write at once.
+                        let buf: libc::c_int = 1 << 20; // 1 MiB
+                        unsafe {
+                            libc::setsockopt(
+                                fd,
+                                libc::SOL_SOCKET,
+                                libc::SO_SNDBUF,
+                                &buf as *const _ as *const libc::c_void,
+                                std::mem::size_of_val(&buf) as libc::socklen_t,
+                            );
+                        }
                         let std_stream = unsafe { std::net::TcpStream::from_raw_fd(fd) };
                         if std_stream.set_nonblocking(true).is_err() {
                             continue;

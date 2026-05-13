@@ -41,6 +41,18 @@ path = "src/bin/validate-blocks-parity.rs"
 name = "sweep-blocks-nprobe"
 path = "src/bin/sweep-blocks-nprobe.rs"
 
+[[bin]]
+name = "measure-cluster-radii"
+path = "src/bin/measure-cluster-radii.rs"
+
+[[bin]]
+name = "measure-bbox-prune-rate"
+path = "src/bin/measure-bbox-prune-rate.rs"
+
+[[bin]]
+name = "measure-bbox-i8-prune-rate"
+path = "src/bin/measure-bbox-i8-prune-rate.rs"
+
 [profile.release]
 lto = true
 codegen-units = 1
