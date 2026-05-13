@@ -30,13 +30,17 @@ fn squared_distance_scalar(a: &[i16], b: &[i16]) -> i64 {
 use std::arch::x86::{
     __m128i, __m256i, _mm256_add_epi64, _mm256_castsi256_si128, _mm256_cvtepi16_epi32,
     _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_mul_epi32, _mm256_set1_epi32,
-    _mm256_setzero_si256, _mm256_srli_epi64, _mm256_storeu_si256, _mm256_sub_epi32, _mm_loadu_si128,
+    _mm256_setzero_si256, _mm256_srli_epi64, _mm256_storeu_si256, _mm256_sub_epi32,
+    _mm_add_epi16, _mm_loadu_si128, _mm_madd_epi16, _mm_max_epi16, _mm_setzero_si128,
+    _mm_storeu_si128, _mm_subs_epi16,
 };
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::{
     __m128i, __m256i, _mm256_add_epi64, _mm256_castsi256_si128, _mm256_cvtepi16_epi32,
     _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_mul_epi32, _mm256_set1_epi32,
-    _mm256_setzero_si256, _mm256_srli_epi64, _mm256_storeu_si256, _mm256_sub_epi32, _mm_loadu_si128,
+    _mm256_setzero_si256, _mm256_srli_epi64, _mm256_storeu_si256, _mm256_sub_epi32,
+    _mm_add_epi16, _mm_loadu_si128, _mm_madd_epi16, _mm_max_epi16, _mm_setzero_si128,
+    _mm_storeu_si128, _mm_subs_epi16,
 };
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -769,57 +773,147 @@ fn bbox_lower_bound_l2(
     sum
 }
 
-// Find the single closest centroid by L2² (no top-K bookkeeping — simple min).
-#[inline]
-fn nearest_centroid_blocks<FC>(ivf: &IvfBlocks, q: &[i16; DIM], distance: FC) -> usize
-where
-    FC: Fn(&[i16], &[i16]) -> i64 + Copy,
-{
-    let mut best_d = i64::MAX;
-    let mut best_c = 0usize;
-    for c in 0..ivf.k {
-        let d = distance(q, ivf.centroid(c));
-        if d < best_d {
-            best_d = d;
-            best_c = c;
+// AVX2 version: load 8 dims via SSE (lower-half __m128i), compute squared gaps
+// with saturating sub + max(.,0) + madd_epi16. Remaining 6 dims scalar tail.
+// Same early-exit semantics as the scalar version.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn bbox_lower_bound_l2_avx2(
+    bbox_min: &[i16],
+    bbox_max: &[i16],
+    q: &[i16; DIM],
+    stop_after: i64,
+) -> i64 {
+    let q8 = _mm_loadu_si128(q.as_ptr() as *const __m128i);
+    let lo8 = _mm_loadu_si128(bbox_min.as_ptr() as *const __m128i);
+    let hi8 = _mm_loadu_si128(bbox_max.as_ptr() as *const __m128i);
+
+    // Saturating sub keeps positive overflows clamped at i16::MAX; max with 0
+    // clamps the "inside box" case (negative diff) to 0. At most one of lo_gap
+    // / hi_gap is non-zero per lane.
+    let zero = _mm_setzero_si128();
+    let lo_gap = _mm_max_epi16(_mm_subs_epi16(lo8, q8), zero);
+    let hi_gap = _mm_max_epi16(_mm_subs_epi16(q8, hi8), zero);
+    let gap = _mm_add_epi16(lo_gap, hi_gap);
+
+    // madd_epi16: per pair of adjacent i16 lanes, returns (a*c + b*d) as i32.
+    // Squared distance of 8 i16 lanes -> 4 i32 lanes whose sum is the total.
+    let sq = _mm_madd_epi16(gap, gap);
+    let mut lanes = [0i32; 4];
+    _mm_storeu_si128(lanes.as_mut_ptr() as *mut __m128i, sq);
+    let mut sum: i64 =
+        lanes[0] as i64 + lanes[1] as i64 + lanes[2] as i64 + lanes[3] as i64;
+
+    if sum > stop_after {
+        return sum;
+    }
+
+    // Tail: dims 8..DIM scalar.
+    for d in 8..DIM {
+        let target = q[d] as i64;
+        let lo = bbox_min[d] as i64;
+        let hi = bbox_max[d] as i64;
+        let gap = if target < lo {
+            lo - target
+        } else if target > hi {
+            target - hi
+        } else {
+            0
+        };
+        sum += gap * gap;
+        if sum > stop_after {
+            return sum;
         }
     }
-    best_c
+    sum
 }
 
-fn predict_bucket_ivf_blocks_bbox_with<FB, FC>(
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline]
+fn bbox_lower_bound_l2_avx2_checked(
+    bbox_min: &[i16],
+    bbox_max: &[i16],
+    q: &[i16; DIM],
+    stop_after: i64,
+) -> i64 {
+    debug_assert!(std::is_x86_feature_detected!("avx2"));
+    unsafe { bbox_lower_bound_l2_avx2(bbox_min, bbox_max, q, stop_after) }
+}
+
+// Top-N closest centroids written into a fixed-size buffer (no heap alloc).
+// Returns the number of valid entries (≤ N). N is small (3-5), so insertion
+// sort beats heap maintenance.
+#[inline]
+fn top_n_centroids_fixed<FC, const N: usize>(
+    ivf: &IvfBlocks,
+    q: &[i16; DIM],
+    distance: FC,
+    out: &mut [u32; N],
+) where
+    FC: Fn(&[i16], &[i16]) -> i64 + Copy,
+{
+    let mut dists = [i64::MAX; N];
+    for c in 0..ivf.k {
+        let d = distance(q, ivf.centroid(c));
+        if d >= dists[N - 1] {
+            continue;
+        }
+        let mut pos = N - 1;
+        while pos > 0 && d < dists[pos - 1] {
+            dists[pos] = dists[pos - 1];
+            out[pos] = out[pos - 1];
+            pos -= 1;
+        }
+        dists[pos] = d;
+        out[pos] = c as u32;
+    }
+}
+
+// Number of closest clusters scanned unconditionally to build a tight initial
+// top-5 before the bbox-pruned sweep. With a tight top-5 the bbox lower-bound
+// rejects most remaining clusters in 1-2 dims and never touches a vector.
+const BBOX_SEED_K: usize = 3;
+
+fn predict_bucket_ivf_blocks_bbox_with<FB, FC, FBB>(
     ivf: &IvfBlocks,
     query: &[f64; 14],
     block_distances: FB,
     centroid_distance: FC,
+    bbox_lb: FBB,
 ) -> u8
 where
     FB: Fn(&[i16; DIM], &[i16]) -> [i64; BLOCK_SIZE] + Copy,
     FC: Fn(&[i16], &[i16]) -> i64 + Copy,
+    FBB: Fn(&[i16], &[i16], &[i16; DIM], i64) -> i64 + Copy,
 {
     let q = quantize_query(query, ivf.scale);
 
+    // Phase 1: top-N closest centroids -> scan them all unconditionally.
+    let mut seeds: [u32; BBOX_SEED_K] = [u32::MAX; BBOX_SEED_K];
+    top_n_centroids_fixed::<_, BBOX_SEED_K>(ivf, &q, centroid_distance, &mut seeds);
+
     let mut distances = [i64::MAX; TOP_K];
     let mut indexes = [0u32; TOP_K];
-
-    // Phase 1: scan the single closest cluster to get an initial top-5.
-    let seed = nearest_centroid_blocks(ivf, &q, centroid_distance);
-    for block_idx in ivf.cluster_block_range(seed) {
-        scan_block_soa(ivf, block_idx, &q, &mut distances, &mut indexes, block_distances);
+    for &s in &seeds {
+        if s == u32::MAX {
+            continue;
+        }
+        for block_idx in ivf.cluster_block_range(s as usize) {
+            scan_block_soa(ivf, block_idx, &q, &mut distances, &mut indexes, block_distances);
+        }
     }
 
-    // Phase 2: bbox-pruned sweep of every other cluster. For each, the bbox
-    // lower-bound says "no point in this cluster can be closer than X". If
-    // X exceeds the current worst-of-top-5, the cluster can't change the
-    // result and we skip it.
+    // Phase 2: bbox-pruned sweep of every other cluster.
     for c in 0..ivf.k {
-        if c == seed {
+        // skip seeds (membership check is O(BBOX_SEED_K), tiny)
+        let c32 = c as u32;
+        if seeds[0] == c32 || seeds[1] == c32 || seeds[2] == c32 {
             continue;
         }
         let worst = distances[TOP_K - 1];
         let bbox_min = ivf.bbox_min_for(c);
         let bbox_max = ivf.bbox_max_for(c);
-        let lb = bbox_lower_bound_l2(bbox_min, bbox_max, &q, worst);
+        let lb = bbox_lb(bbox_min, bbox_max, &q, worst);
         if lb > worst {
             continue;
         }
@@ -831,10 +925,11 @@ where
     bucket_from_blocks_top5(ivf, &indexes)
 }
 
-/// Bbox-repair IVF: nearest-centroid seed + L2² bbox lower-bound pruning
-/// across the remaining K-1 clusters. Recall identical to full-scan (the
-/// pruning is provably exact — triangle inequality), but ~90%+ of clusters
-/// are eliminated without touching a single vector.
+/// Bbox-repair IVF: top-3 closest centroids seed + L2² bbox lower-bound
+/// pruning across the remaining K-3 clusters. Recall identical to full-scan
+/// (the pruning is provably exact — triangle inequality), but with a tight
+/// top-5 from the seed scans the bbox check rejects ~99% of clusters in 1-2
+/// dimensions without touching a single vector.
 pub fn predict_bucket_ivf_blocks_bbox_repair(ivf: &IvfBlocks, query: &[f64; 14]) -> u8 {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
@@ -844,6 +939,7 @@ pub fn predict_bucket_ivf_blocks_bbox_repair(ivf: &IvfBlocks, query: &[f64; 14])
                 query,
                 block_distances_avx2_checked,
                 squared_distance_avx2_checked,
+                bbox_lower_bound_l2_avx2_checked,
             );
         }
     }
@@ -852,6 +948,7 @@ pub fn predict_bucket_ivf_blocks_bbox_repair(ivf: &IvfBlocks, query: &[f64; 14])
         query,
         block_distances_scalar,
         squared_distance_scalar,
+        bbox_lower_bound_l2,
     )
 }
 
