@@ -1,6 +1,6 @@
 services:
   app1:
-    image: ghcr.io/gustavoqnt/gustavoqntsrv:v5875
+    image: ghcr.io/gustavoqnt/gustavoqntsrv:sndbuf-1m
     hostname: app1
     environment:
       IVF_BLOCKS_PATH: "/app/resources/references.ivf-blocks-K4096.bin"
@@ -26,7 +26,7 @@ services:
           memory: "160MB"
 
   app2:
-    image: ghcr.io/gustavoqnt/gustavoqntsrv:v5875
+    image: ghcr.io/gustavoqnt/gustavoqntsrv:sndbuf-1m
     hostname: app2
     environment:
       IVF_BLOCKS_PATH: "/app/resources/references.ivf-blocks-K4096.bin"
