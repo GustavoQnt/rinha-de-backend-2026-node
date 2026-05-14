@@ -74,7 +74,6 @@ fn worker_main_tcp(
     index: &'static Index,
     responses: &'static Responses,
 ) {
-    pin_to_cpu_env();
     let mut rt = RuntimeBuilder::<monoio::IoUringDriver>::new()
         .with_entries(1024)
         .enable_timer()
@@ -111,7 +110,6 @@ fn worker_main_uds(
     index: &'static Index,
     responses: &'static Responses,
 ) {
-    pin_to_cpu_env();
     let mut rt = RuntimeBuilder::<monoio::IoUringDriver>::new()
         .with_entries(1024)
         .enable_timer()
@@ -173,34 +171,6 @@ fn num_cpus_or_default() -> usize {
         .unwrap_or(4)
 }
 
-/// Pin the calling thread to the CPU index specified by `RINHA_PIN_CPU`
-/// (no-op if unset or empty). Reduces cross-core cache thrash + scheduler
-/// jitter when the container's cpu.max quota throttles us into bursts.
-fn pin_to_cpu_env() {
-    let cpu = match env::var("RINHA_PIN_CPU") {
-        Ok(s) => match s.trim().parse::<usize>() {
-            Ok(n) => n,
-            Err(_) => return,
-        },
-        Err(_) => return,
-    };
-    unsafe {
-        let mut set: libc::cpu_set_t = std::mem::zeroed();
-        libc::CPU_ZERO(&mut set);
-        libc::CPU_SET(cpu, &mut set);
-        let rc = libc::sched_setaffinity(
-            0,
-            std::mem::size_of::<libc::cpu_set_t>(),
-            &set as *const _,
-        );
-        if rc == 0 {
-            eprintln!("pinned thread to CPU {cpu}");
-        } else {
-            eprintln!("sched_setaffinity(cpu={cpu}) failed: errno={}", *libc::__errno_location());
-        }
-    }
-}
-
 // ---- SCM_RIGHTS path -----------------------------------------------------
 //
 // Runs a single monoio runtime that consumes TCP file descriptors handed
@@ -210,8 +180,6 @@ fn pin_to_cpu_env() {
 pub fn serve_scm(sock_path: String, index: Arc<Index>, responses: Arc<Responses>) {
     use std::os::unix::io::FromRawFd;
     use std::sync::Mutex;
-
-    pin_to_cpu_env();
 
     let index_ref: &'static Index = unsafe { &*Arc::into_raw(index) };
     let responses_ref: &'static Responses = unsafe { &*Arc::into_raw(responses) };

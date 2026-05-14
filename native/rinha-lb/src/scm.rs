@@ -23,7 +23,7 @@ pub unsafe fn send_fd(ctrl: libc::c_int, fd: libc::c_int) {
 
     let mut dummy: u8 = 0;
     let mut iov = libc::iovec {
-        iov_base: &mut dummy as *mut u8 as *mut libc::c_void,
+        iov_base: &mut dummy as *mut u8 as *mut libc::c_void,0
         iov_len: 1,
     };
 
