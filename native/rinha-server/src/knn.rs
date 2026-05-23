@@ -726,10 +726,15 @@ pub fn predict_bucket_ivf_blocks_two_pass(
     let q = quantize_query(query, ivf.scale);
     let top = ivf_blocks_top5(ivf, &q, fast_nprobe);
     let bucket = bucket_from_blocks_top5(ivf, &top);
-    // Escalate any non-extreme bucket: clear legit (0) and clear fraud (5)
-    // are fast-path; anything else (1..=4) re-scans at full nprobe.
-    if bucket == 0 || bucket == TOP_K as u8 {
-        return bucket;
+    // Asymmetric short-circuit: only trust "clear legit" (bucket==0) from the
+    // fast pass. Empirically, at low fast_nprobe a fast verdict of bucket==5
+    // ("clear fraud") produces FPs at ~7x the rate of FNs from bucket==0 —
+    // fraud clusters are locally denser than the global population, so a tiny
+    // scan can coincidentally land on 5 fraud neighbors when the true K-NN
+    // would include legit refs from unprobed clusters. Always escalate when
+    // the fast pass sees any fraud signal.
+    if bucket == 0 {
+        return 0;
     }
     let top_full = ivf_blocks_top5(ivf, &q, full_nprobe);
     bucket_from_blocks_top5(ivf, &top_full)

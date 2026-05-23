@@ -264,7 +264,7 @@ fn main() {
             let top = if let Some(fast_nprobe) = args.fast_nprobe {
                 let fast_top = ivf_blocks_top5(&blocks, q, fast_nprobe);
                 let fast_bucket = bucket_from_top5(&refs, &fast_top);
-                if fast_bucket == 0 || fast_bucket == 5 {
+                if fast_bucket == 0 {
                     fast_top
                 } else {
                     ivf_blocks_top5(&blocks, q, nprobe)
