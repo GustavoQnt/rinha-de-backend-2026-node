@@ -19,7 +19,7 @@ WORKDIR /app
 
 ENV IVF_PATH=/app/resources/references.ivf.bin
 ENV IVF_BLOCKS_PATH=/app/resources/references.ivf-blocks-K4096.bin
-ENV IVF_NPROBE=32
+ENV IVF_NPROBE=96
 ENV SOCK_PATH=/run/rinha/rinha.sock
 
 COPY --from=builder /build/native/rinha-server/target/release/rinha-server /app/rinha-server

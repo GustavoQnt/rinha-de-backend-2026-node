@@ -10,6 +10,7 @@
 //                       --requests test/test-data.requests.ndjson \
 //                       --expected-buckets test/test-data.expected-buckets.ndjson \
 //                       --nprobes 256,192,128,96,64,48,32
+//                       [--fast-nprobe 8]
 
 use std::env;
 use std::fs::File;
@@ -33,6 +34,7 @@ struct Args {
     requests_path: String,
     expected_buckets_path: Option<String>,
     nprobes: Vec<usize>,
+    fast_nprobe: Option<usize>,
     analyze_mismatches: bool,
     max_mismatches: usize,
 }
@@ -43,6 +45,7 @@ fn parse_args() -> Args {
     let mut requests_path = "test/test-data.requests.ndjson".to_string();
     let mut expected_buckets_path: Option<String> = None;
     let mut nprobes: Option<Vec<usize>> = None;
+    let mut fast_nprobe: Option<usize> = None;
     let mut analyze_mismatches = false;
     let mut max_mismatches = DEFAULT_MAX_MISMATCHES;
     let args: Vec<String> = env::args().skip(1).collect();
@@ -60,6 +63,10 @@ fn parse_args() -> Args {
                 nprobes = Some(
                     args[i + 1].split(',').map(|s| s.trim().parse().expect("--nprobes int")).collect()
                 );
+                i += 2;
+            }
+            "--fast-nprobe" => {
+                fast_nprobe = Some(args[i + 1].parse().expect("--fast-nprobe int"));
                 i += 2;
             }
             "--analyze-mismatches" | "--mismatches" => {
@@ -80,6 +87,7 @@ fn parse_args() -> Args {
         requests_path,
         expected_buckets_path,
         nprobes,
+        fast_nprobe,
         analyze_mismatches,
         max_mismatches,
     }
@@ -180,6 +188,10 @@ fn main() {
     for &n in &args.nprobes {
         assert!(n <= blocks.k, "nprobe {n} exceeds K={}", blocks.k);
     }
+    if let Some(fast) = args.fast_nprobe {
+        assert!(fast <= blocks.k, "fast nprobe {fast} exceeds K={}", blocks.k);
+        eprintln!("two-pass mode: fast_nprobe={} full_nprobe=<swept>", fast);
+    }
 
     eprintln!("loading queries from {} ...", args.requests_path);
     let file = File::open(&args.requests_path).expect("open requests");
@@ -233,7 +245,7 @@ fn main() {
     let edge_count = edge_mask.iter().filter(|&&x| x).count();
     eprintln!("edge cases (bucket in {{2,3}}): {} / {}", edge_count, total);
 
-    println!("nprobe,total,top5_mismatches,bucket_mismatches,edge_cases,edge_bucket_mismatches,ms_mean,ms_p50,ms_p95,ms_p99,ms_max,sweep_secs");
+    println!("nprobe,total,top5_mismatches,bucket_mismatches,approved_mismatches,edge_cases,edge_bucket_mismatches,ms_mean,ms_p50,ms_p95,ms_p99,ms_max,sweep_secs");
 
     for &nprobe in &args.nprobes {
         eprintln!("\n--- nprobe={} ---", nprobe);
@@ -241,6 +253,7 @@ fn main() {
         let mut latencies_ns: Vec<u64> = Vec::with_capacity(total);
         let mut top5_mm = 0usize;
         let mut bucket_mm = 0usize;
+        let mut approved_mm = 0usize;
         let mut edge_bucket_mm = 0usize;
         let mut bucket_matrix = [[0usize; 6]; 6];
         let mut top5_samples: Vec<String> = Vec::new();
@@ -248,7 +261,17 @@ fn main() {
 
         for (i, q) in queries.iter().enumerate() {
             let t1 = Instant::now();
-            let top = ivf_blocks_top5(&blocks, q, nprobe);
+            let top = if let Some(fast_nprobe) = args.fast_nprobe {
+                let fast_top = ivf_blocks_top5(&blocks, q, fast_nprobe);
+                let fast_bucket = bucket_from_top5(&refs, &fast_top);
+                if fast_bucket == 0 || fast_bucket == 5 {
+                    fast_top
+                } else {
+                    ivf_blocks_top5(&blocks, q, nprobe)
+                }
+            } else {
+                ivf_blocks_top5(&blocks, q, nprobe)
+            };
             latencies_ns.push(t1.elapsed().as_nanos() as u64);
 
             if full_top.is_some_and(|tops| top != tops[i]) {
@@ -266,6 +289,9 @@ fn main() {
             if b != full_bucket[i] {
                 bucket_mm += 1;
                 bucket_matrix[full_bucket[i] as usize][b as usize] += 1;
+                if (b < 3) != (full_bucket[i] < 3) {
+                    approved_mm += 1;
+                }
                 if edge_mask[i] { edge_bucket_mm += 1; }
                 if args.analyze_mismatches && bucket_samples.len() < args.max_mismatches {
                     if let Some(expected_top) = full_top {
@@ -292,8 +318,8 @@ fn main() {
         let max = *latencies_ns.last().unwrap() as f64;
 
         eprintln!(
-            "  done: top5_mm={} bucket_mm={} edge_bucket_mm={} mean={:.3}ms p99={:.3}ms in {:.1}s",
-            top5_mm, bucket_mm, edge_bucket_mm, mean / 1e6, p99 / 1e6, sweep_secs
+            "  done: top5_mm={} bucket_mm={} approved_mm={} edge_bucket_mm={} mean={:.3}ms p99={:.3}ms in {:.1}s",
+            top5_mm, bucket_mm, approved_mm, edge_bucket_mm, mean / 1e6, p99 / 1e6, sweep_secs
         );
         if args.analyze_mismatches {
             if bucket_mm == 0 {
@@ -331,11 +357,12 @@ fn main() {
             }
         }
         println!(
-            "{},{},{},{},{},{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.1}",
+            "{},{},{},{},{},{},{},{:.4},{:.4},{:.4},{:.4},{:.4},{:.1}",
             nprobe,
             total,
             if full_top.is_some() { top5_mm.to_string() } else { "NA".to_string() },
             bucket_mm,
+            approved_mm,
             edge_count,
             edge_bucket_mm,
             mean / 1e6, p50 / 1e6, p95 / 1e6, p99 / 1e6, max / 1e6, sweep_secs,

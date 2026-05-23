@@ -677,9 +677,9 @@ pub fn warmup_ivf_blocks(ivf: &IvfBlocks, rounds: usize) {
     unsafe { std::ptr::read_volatile(&acc); }
 }
 
-// Slightly above the production full nprobe so the warmup exercises a
-// superset of cluster scans during the dry-run.
-const IVF_FULL_NPROBE_WARMUP: usize = 24;
+// Match the production full nprobe so the warmup exercises the same cluster
+// scan depth used by borderline requests.
+const IVF_FULL_NPROBE_WARMUP: usize = 96;
 
 #[inline(never)]
 fn touch_i16(buf: &[i16], stride_bytes: usize) {
