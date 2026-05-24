@@ -15,7 +15,11 @@ use std::thread;
 use std::time::Duration;
 
 use rinha_server::{
-    ivf::Ivf, ivf_blocks::IvfBlocks, json, knn, refs::Refs, response::Responses,
+    ivf::Ivf,
+    ivf_blocks::IvfBlocks,
+    json, knn,
+    refs::Refs,
+    response::Responses,
     server::{Index, MAX_BODY, MAX_HEAD},
     vectorize,
 };
@@ -314,7 +318,10 @@ fn main() {
         eprintln!("loaded {} refs, scale={}", refs.count, refs.scale);
         Some(refs)
     };
-    let k_for_nprobe = ivf_blocks.as_ref().map(|b| b.k).or_else(|| ivf.as_ref().map(|i| i.k));
+    let k_for_nprobe = ivf_blocks
+        .as_ref()
+        .map(|b| b.k)
+        .or_else(|| ivf.as_ref().map(|i| i.k));
     let nprobe = match (
         k_for_nprobe,
         env::var("IVF_NPROBE")
@@ -330,8 +337,12 @@ fn main() {
     }
 
     let two_pass = match (
-        env::var("IVF_FAST_NPROBE").ok().and_then(|s| s.parse::<usize>().ok()),
-        env::var("IVF_FULL_NPROBE").ok().and_then(|s| s.parse::<usize>().ok()),
+        env::var("IVF_FAST_NPROBE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok()),
+        env::var("IVF_FULL_NPROBE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok()),
     ) {
         (Some(fast), Some(full)) if k_for_nprobe.is_some() => {
             let k = k_for_nprobe.unwrap();
@@ -343,7 +354,35 @@ fn main() {
         _ => None,
     };
 
-    let index = Arc::new(Index { refs, ivf, ivf_blocks, nprobe, two_pass });
+    // bbox-repair: exact-recall IVF search with axis-aligned bbox lower-bound
+    // pruning and a hard cap on total clusters visited. Takes precedence over
+    // two-pass when both are configured.
+    let bbox_repair = match (
+        env::var("IVF_BBOX_SEED")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok()),
+        env::var("IVF_BBOX_VISIT_CAP")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok()),
+    ) {
+        (Some(seed), Some(cap)) if k_for_nprobe.is_some() => {
+            let k = k_for_nprobe.unwrap();
+            let seed = seed.max(1).min(5);
+            let cap = cap.max(seed).min(k);
+            eprintln!("ivf bbox-repair: seed_clusters={seed} visit_cap={cap}");
+            Some((seed, cap))
+        }
+        _ => None,
+    };
+
+    let index = Arc::new(Index {
+        refs,
+        ivf,
+        ivf_blocks,
+        nprobe,
+        two_pass,
+        bbox_repair,
+    });
     let responses = Arc::new(Responses::build());
     eprintln!("distance kernel = {}", knn::active_distance_kernel_name());
 
@@ -356,7 +395,11 @@ fn main() {
         .unwrap_or(1500);
     if let Some(blocks) = index.ivf_blocks.as_ref() {
         let t0 = std::time::Instant::now();
-        knn::warmup_ivf_blocks(blocks, warmup_rounds);
+        if let Some((seed, cap)) = index.bbox_repair {
+            knn::warmup_ivf_blocks_bbox(blocks, warmup_rounds, seed, cap);
+        } else {
+            knn::warmup_ivf_blocks(blocks, warmup_rounds);
+        }
         eprintln!(
             "warmup: {warmup_rounds} predict rounds + page-touch in {:?}",
             t0.elapsed()

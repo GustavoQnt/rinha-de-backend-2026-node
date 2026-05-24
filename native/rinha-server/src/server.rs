@@ -12,11 +12,15 @@ pub struct Index {
     pub ivf_blocks: Option<IvfBlocks>,
     pub nprobe: usize,
     pub two_pass: Option<(usize, usize)>,
+    pub bbox_repair: Option<(usize, usize)>, // (seed_clusters, visit_cap)
 }
 
 impl Index {
     pub fn predict(&self, v: &[f64; 14]) -> u8 {
         if let Some(blocks) = &self.ivf_blocks {
+            if let Some((seed, cap)) = self.bbox_repair {
+                return knn::predict_bucket_ivf_blocks_bbox_repair(blocks, v, seed, cap);
+            }
             if let Some((fast, full)) = self.two_pass {
                 return knn::predict_bucket_ivf_blocks_two_pass(blocks, v, fast, full);
             }

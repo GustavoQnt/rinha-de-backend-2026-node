@@ -18,12 +18,19 @@ pub struct IvfBlocks {
     pub count: usize,
     pub scale: u32,
     pub total_blocks: usize,
-    pub centroids: Vec<i16>,             // K × DIM
-    pub block_offsets: Vec<u32>,         // (K+1), cumulative blocks
-    pub block_vectors: Vec<i16>,         // total_blocks × 112, SoA-by-block
-    pub block_origin: Vec<u32>,          // total_blocks × 8, u32::MAX for padding
-    pub block_labels: Vec<u8>,           // total_blocks × 8, 0xFF for padding
-    pub labels_by_origin: Vec<u8>,       // count
+    pub centroids: Vec<i16>,       // K × DIM
+    pub block_offsets: Vec<u32>,   // (K+1), cumulative blocks
+    pub block_vectors: Vec<i16>,   // total_blocks × 112, SoA-by-block
+    pub block_origin: Vec<u32>,    // total_blocks × 8, u32::MAX for padding
+    pub block_labels: Vec<u8>,     // total_blocks × 8, 0xFF for padding
+    pub labels_by_origin: Vec<u8>, // count
+    // Per-cluster axis-aligned bounding boxes over the cluster's actual vectors,
+    // in quantized i16 space. K × DIM each. Used for L2² lower-bound pruning:
+    // for any cluster, the closest vector inside it is at least the distance
+    // from the query to the bbox. Empty clusters keep the sentinel
+    // (i16::MAX, i16::MIN), which produces an effectively infinite bound.
+    pub bbox_min: Vec<i16>,
+    pub bbox_max: Vec<i16>,
 }
 
 unsafe impl Send for IvfBlocks {}
@@ -40,7 +47,10 @@ impl IvfBlocks {
         assert_eq!(&bytes[0..4], MAGIC, "invalid ivf-blocks magic");
 
         let version = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-        assert_eq!(version, VERSION, "unsupported ivf-blocks version: {version}");
+        assert_eq!(
+            version, VERSION,
+            "unsupported ivf-blocks version: {version}"
+        );
 
         let k = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
         let dim = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
@@ -49,7 +59,10 @@ impl IvfBlocks {
         let block_size = u32::from_le_bytes(bytes[24..28].try_into().unwrap()) as usize;
         let total_blocks = u32::from_le_bytes(bytes[28..32].try_into().unwrap()) as usize;
         assert_eq!(dim, DIM, "unexpected ivf-blocks dim: {dim}");
-        assert_eq!(block_size, BLOCK_SIZE, "unexpected block_size: {block_size}");
+        assert_eq!(
+            block_size, BLOCK_SIZE,
+            "unexpected block_size: {block_size}"
+        );
 
         let centroids_bytes = k * DIM * 2;
         let block_offsets_bytes = (k + 1) * 4;
@@ -90,6 +103,8 @@ impl IvfBlocks {
         assert_eq!(block_offsets[0], 0);
         assert_eq!(block_offsets[k] as usize, total_blocks);
 
+        let (bbox_min, bbox_max) = compute_bboxes(k, &block_offsets, &block_vectors, &block_origin);
+
         IvfBlocks {
             k,
             count,
@@ -101,7 +116,19 @@ impl IvfBlocks {
             block_origin,
             block_labels,
             labels_by_origin,
+            bbox_min,
+            bbox_max,
         }
+    }
+
+    #[inline(always)]
+    pub fn bbox_min_for(&self, c: usize) -> &[i16] {
+        &self.bbox_min[c * DIM..(c + 1) * DIM]
+    }
+
+    #[inline(always)]
+    pub fn bbox_max_for(&self, c: usize) -> &[i16] {
+        &self.bbox_max[c * DIM..(c + 1) * DIM]
     }
 
     #[inline(always)]
@@ -130,4 +157,44 @@ impl IvfBlocks {
     pub fn label_by_origin(&self, i: usize) -> u8 {
         self.labels_by_origin[i]
     }
+}
+
+// Walk every non-padding slot in every block and aggregate per-cluster min/max
+// per dimension. Empty clusters keep the (i16::MAX, i16::MIN) sentinel — the
+// bbox lower-bound then evaluates to a large positive value, so empty clusters
+// get pruned without needing a special-case check on the hot path.
+pub(crate) fn compute_bboxes(
+    k: usize,
+    block_offsets: &[u32],
+    block_vectors: &[i16],
+    block_origin: &[u32],
+) -> (Vec<i16>, Vec<i16>) {
+    let mut bbox_min = vec![i16::MAX; k * DIM];
+    let mut bbox_max = vec![i16::MIN; k * DIM];
+
+    for c in 0..k {
+        let blocks = block_offsets[c] as usize..block_offsets[c + 1] as usize;
+        for block_idx in blocks {
+            let block = &block_vectors[block_idx * BLOCK_LANES..(block_idx + 1) * BLOCK_LANES];
+            let origins = &block_origin[block_idx * BLOCK_SIZE..(block_idx + 1) * BLOCK_SIZE];
+            for slot in 0..BLOCK_SIZE {
+                if origins[slot] == u32::MAX {
+                    continue;
+                }
+                for d in 0..DIM {
+                    let v = block[d * BLOCK_SIZE + slot];
+                    let min_slot = &mut bbox_min[c * DIM + d];
+                    if v < *min_slot {
+                        *min_slot = v;
+                    }
+                    let max_slot = &mut bbox_max[c * DIM + d];
+                    if v > *max_slot {
+                        *max_slot = v;
+                    }
+                }
+            }
+        }
+    }
+
+    (bbox_min, bbox_max)
 }

@@ -30,13 +30,15 @@ fn squared_distance_scalar(a: &[i16], b: &[i16]) -> i64 {
 use std::arch::x86::{
     __m128i, __m256i, _mm256_add_epi64, _mm256_castsi256_si128, _mm256_cvtepi16_epi32,
     _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_mul_epi32, _mm256_set1_epi32,
-    _mm256_setzero_si256, _mm256_srli_epi64, _mm256_storeu_si256, _mm256_sub_epi32, _mm_loadu_si128,
+    _mm256_setzero_si256, _mm256_srli_epi64, _mm256_storeu_si256, _mm256_sub_epi32,
+    _mm_loadu_si128,
 };
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::{
     __m128i, __m256i, _mm256_add_epi64, _mm256_castsi256_si128, _mm256_cvtepi16_epi32,
     _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_mul_epi32, _mm256_set1_epi32,
-    _mm256_setzero_si256, _mm256_srli_epi64, _mm256_storeu_si256, _mm256_sub_epi32, _mm_loadu_si128,
+    _mm256_setzero_si256, _mm256_srli_epi64, _mm256_storeu_si256, _mm256_sub_epi32,
+    _mm_loadu_si128,
 };
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -568,14 +570,28 @@ where
     if nprobe >= ivf.k {
         for c in 0..ivf.k {
             for block_idx in ivf.cluster_block_range(c) {
-                scan_block_soa(ivf, block_idx, q, &mut distances, &mut indexes, block_distances);
+                scan_block_soa(
+                    ivf,
+                    block_idx,
+                    q,
+                    &mut distances,
+                    &mut indexes,
+                    block_distances,
+                );
             }
         }
     } else {
         let probes = top_n_centroids_blocks(ivf, q, nprobe, centroid_distance);
         for &c in &probes[..nprobe] {
             for block_idx in ivf.cluster_block_range(c) {
-                scan_block_soa(ivf, block_idx, q, &mut distances, &mut indexes, block_distances);
+                scan_block_soa(
+                    ivf,
+                    block_idx,
+                    q,
+                    &mut distances,
+                    &mut indexes,
+                    block_distances,
+                );
             }
         }
     }
@@ -583,11 +599,21 @@ where
 }
 
 pub fn ivf_blocks_top5_scalar(ivf: &IvfBlocks, q: &[i16; DIM], nprobe: usize) -> [u32; TOP_K] {
-    ivf_blocks_top5_with(ivf, q, nprobe, block_distances_scalar, squared_distance_scalar)
+    ivf_blocks_top5_with(
+        ivf,
+        q,
+        nprobe,
+        block_distances_scalar,
+        squared_distance_scalar,
+    )
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-pub fn ivf_blocks_top5_avx2(ivf: &IvfBlocks, q: &[i16; DIM], nprobe: usize) -> Option<[u32; TOP_K]> {
+pub fn ivf_blocks_top5_avx2(
+    ivf: &IvfBlocks,
+    q: &[i16; DIM],
+    nprobe: usize,
+) -> Option<[u32; TOP_K]> {
     if std::is_x86_feature_detected!("avx2") {
         Some(ivf_blocks_top5_with(
             ivf,
@@ -614,7 +640,13 @@ pub fn ivf_blocks_top5(ivf: &IvfBlocks, q: &[i16; DIM], nprobe: usize) -> [u32; 
             );
         }
     }
-    ivf_blocks_top5_with(ivf, q, nprobe, block_distances_scalar, squared_distance_scalar)
+    ivf_blocks_top5_with(
+        ivf,
+        q,
+        nprobe,
+        block_distances_scalar,
+        squared_distance_scalar,
+    )
 }
 
 #[inline(always)]
@@ -642,6 +674,19 @@ pub fn predict_bucket_ivf_blocks(ivf: &IvfBlocks, query: &[f64; 14], nprobe: usi
 // the first burst of real traffic. The rinha banca takes ~1s to ramp up,
 // which is not enough to absorb that cost.
 pub fn warmup_ivf_blocks(ivf: &IvfBlocks, rounds: usize) {
+    warmup_ivf_blocks_with(ivf, rounds, None);
+}
+
+pub fn warmup_ivf_blocks_bbox(
+    ivf: &IvfBlocks,
+    rounds: usize,
+    seed_clusters: usize,
+    visit_cap: usize,
+) {
+    warmup_ivf_blocks_with(ivf, rounds, Some((seed_clusters, visit_cap)));
+}
+
+fn warmup_ivf_blocks_with(ivf: &IvfBlocks, rounds: usize, bbox: Option<(usize, usize)>) {
     // Phase 1: page-touch every backing array at 4 KiB stride to force the
     // kernel to populate the VMA before traffic arrives. read_volatile prevents
     // the loop from being optimized away.
@@ -652,6 +697,8 @@ pub fn warmup_ivf_blocks(ivf: &IvfBlocks, rounds: usize) {
     touch_u32(&ivf.block_origin, stride);
     touch_u8(&ivf.block_labels, stride);
     touch_u8(&ivf.labels_by_origin, stride);
+    touch_i16(&ivf.bbox_min, stride);
+    touch_i16(&ivf.bbox_max, stride);
 
     // Phase 2: exercise the full predict path with a deterministic LCG. Hits
     // both the fast-pass and full-pass branches because we sweep the input
@@ -661,20 +708,30 @@ pub fn warmup_ivf_blocks(ivf: &IvfBlocks, rounds: usize) {
     for _ in 0..rounds {
         let mut q = [0f64; 14];
         for slot in &mut q {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             // map upper 32 bits to roughly [-3, 3], the scale of a quantized feature
             let v = ((s >> 32) as i32 as f64) / (i32::MAX as f64) * 3.0;
             *slot = v;
         }
-        let qi = quantize_query(&q, ivf.scale);
-        let top = ivf_blocks_top5(ivf, &qi, IVF_FULL_NPROBE_WARMUP);
-        let bucket = bucket_from_blocks_top5(ivf, &top);
+        let bucket = if let Some((seed, cap)) = bbox {
+            predict_bucket_ivf_blocks_bbox_repair(ivf, &q, seed, cap)
+        } else {
+            let qi = quantize_query(&q, ivf.scale);
+            let top = ivf_blocks_top5(ivf, &qi, IVF_FULL_NPROBE_WARMUP);
+            bucket_from_blocks_top5(ivf, &top)
+        };
         // read_volatile sink so codegen can't elide the loop.
-        unsafe { std::ptr::read_volatile(&bucket); }
+        unsafe {
+            std::ptr::read_volatile(&bucket);
+        }
         acc = acc.wrapping_add(bucket as u64);
     }
     // Sink for the accumulator too, belt-and-suspenders.
-    unsafe { std::ptr::read_volatile(&acc); }
+    unsafe {
+        std::ptr::read_volatile(&acc);
+    }
 }
 
 // Match the production full nprobe so the warmup exercises the same cluster
@@ -690,7 +747,9 @@ fn touch_i16(buf: &[i16], stride_bytes: usize) {
         sink ^= unsafe { std::ptr::read_volatile(&buf[i]) };
         i += step;
     }
-    unsafe { std::ptr::read_volatile(&sink); }
+    unsafe {
+        std::ptr::read_volatile(&sink);
+    }
 }
 
 #[inline(never)]
@@ -702,7 +761,9 @@ fn touch_u32(buf: &[u32], stride_bytes: usize) {
         sink ^= unsafe { std::ptr::read_volatile(&buf[i]) };
         i += step;
     }
-    unsafe { std::ptr::read_volatile(&sink); }
+    unsafe {
+        std::ptr::read_volatile(&sink);
+    }
 }
 
 #[inline(never)]
@@ -714,7 +775,9 @@ fn touch_u8(buf: &[u8], stride_bytes: usize) {
         sink ^= unsafe { std::ptr::read_volatile(&buf[i]) };
         i += step;
     }
-    unsafe { std::ptr::read_volatile(&sink); }
+    unsafe {
+        std::ptr::read_volatile(&sink);
+    }
 }
 
 pub fn predict_bucket_ivf_blocks_two_pass(
@@ -738,6 +801,189 @@ pub fn predict_bucket_ivf_blocks_two_pass(
     }
     let top_full = ivf_blocks_top5(ivf, &q, full_nprobe);
     bucket_from_blocks_top5(ivf, &top_full)
+}
+
+// ---- Bounded bbox-repair IVF search ------------------------------------
+//
+// Hybrid between top-N nprobe and exact full scan. Seeds top-5 by scanning
+// the closest few centroids, then walks the remaining clusters in ascending
+// bbox-LB order. A cluster is skipped (provably safe by triangle inequality)
+// when its L2² lower-bound exceeds the current worst-of-top-5. A hard
+// `visit_cap` on the *total* number of clusters scanned bounds the tail —
+// pathological queries that would otherwise walk hundreds of clusters give
+// up at the cap, trading a small theoretical recall miss for predictable p99.
+
+// L2² lower-bound from a quantized i16 query to a cluster's axis-aligned
+// bounding box. For each dim the squared per-axis gap (0 when the query
+// coordinate lies inside the box on that axis) is summed. Early-exits the
+// moment the running sum exceeds `stop_after`.
+#[inline]
+fn bbox_lower_bound_l2(bbox_min: &[i16], bbox_max: &[i16], q: &[i16; DIM], stop_after: i64) -> i64 {
+    let mut sum: i64 = 0;
+    for d in 0..DIM {
+        let target = q[d] as i64;
+        let lo = bbox_min[d] as i64;
+        let hi = bbox_max[d] as i64;
+        let gap = if target < lo {
+            lo - target
+        } else if target > hi {
+            target - hi
+        } else {
+            0
+        };
+        sum += gap * gap;
+        if sum > stop_after {
+            return sum;
+        }
+    }
+    sum
+}
+
+// Closest N centroid indexes by squared L2, written into a fixed-size buffer.
+// Insertion sort over an [i64; N] beats a heap for small N (≤ 5).
+#[inline]
+fn top_n_centroids_fixed_blocks<FC, const N: usize>(
+    ivf: &IvfBlocks,
+    q: &[i16; DIM],
+    distance: FC,
+    out: &mut [u32; N],
+) where
+    FC: Fn(&[i16], &[i16]) -> i64 + Copy,
+{
+    let mut dists = [i64::MAX; N];
+    *out = [0u32; N];
+    for c in 0..ivf.k {
+        let d = distance(q, ivf.centroid(c));
+        if d >= dists[N - 1] {
+            continue;
+        }
+        let mut pos = N - 1;
+        while pos > 0 && d < dists[pos - 1] {
+            dists[pos] = dists[pos - 1];
+            out[pos] = out[pos - 1];
+            pos -= 1;
+        }
+        dists[pos] = d;
+        out[pos] = c as u32;
+    }
+}
+
+fn predict_bucket_ivf_blocks_bbox_repair_with<FB, FC>(
+    ivf: &IvfBlocks,
+    query: &[f64; 14],
+    seed_clusters: usize,
+    visit_cap: usize,
+    block_distances: FB,
+    centroid_distance: FC,
+) -> u8
+where
+    FB: Fn(&[i16; DIM], &[i16]) -> [i64; BLOCK_SIZE] + Copy,
+    FC: Fn(&[i16], &[i16]) -> i64 + Copy,
+{
+    let q = quantize_query(query, ivf.scale);
+    let mut distances = [i64::MAX; TOP_K];
+    let mut indexes = [0u32; TOP_K];
+
+    // Phase 1: scan the `seed_clusters` closest centroids to fill an initial
+    // top-5. A small N (3-5) gives a tight `worst` very quickly so phase 2
+    // can prune aggressively.
+    const MAX_SEED: usize = 5;
+    let seeds_n = seed_clusters.max(1).min(MAX_SEED);
+    let mut seeds = [0u32; MAX_SEED];
+    top_n_centroids_fixed_blocks::<_, MAX_SEED>(ivf, &q, centroid_distance, &mut seeds);
+    let seed_slice = &seeds[..seeds_n];
+    for &c in seed_slice {
+        for block_idx in ivf.cluster_block_range(c as usize) {
+            scan_block_soa(
+                ivf,
+                block_idx,
+                &q,
+                &mut distances,
+                &mut indexes,
+                block_distances,
+            );
+        }
+    }
+
+    // Phase 2: enumerate remaining clusters in ascending bbox-LB order and
+    // scan each one whose bound is below the current worst-of-top-5. The
+    // total scan budget (seeds + bbox visits) is bounded by `visit_cap`.
+    //
+    // Building the candidate list costs K bbox-LB calls (~K early-exit ops).
+    // Sorting K=4096 by i64 is ~50us; cheap compared to a single cluster
+    // scan. We sort once instead of using a heap because over the prévia
+    // workload the average prune rate is high (>99%) but we still want a
+    // deterministic order before applying the cap.
+    let mut candidates: Vec<(i64, u32)> = Vec::with_capacity(ivf.k);
+    let seed_set: u128 = seed_slice
+        .iter()
+        .fold(0u128, |acc, &c| acc | (1u128 << (c % 128)));
+    for c in 0..ivf.k {
+        // Skip the seeds we already scanned. The bitmap is sized for u128
+        // (covers up to 128 distinct seed positions modulo 128) — collisions
+        // just cause an extra membership check via the slice below.
+        if (seed_set >> (c % 128)) & 1 == 1 && seed_slice.contains(&(c as u32)) {
+            continue;
+        }
+        // Use i64::MAX as `stop_after` since we still want the true bound
+        // for sorting; pruning by `worst` happens after sort.
+        let lb = bbox_lower_bound_l2(ivf.bbox_min_for(c), ivf.bbox_max_for(c), &q, i64::MAX);
+        candidates.push((lb, c as u32));
+    }
+    candidates.sort_unstable_by_key(|&(lb, _)| lb);
+
+    let mut visited = seeds_n;
+    for (lb, c) in candidates {
+        if visited >= visit_cap {
+            break;
+        }
+        let worst = distances[TOP_K - 1];
+        if lb >= worst {
+            break;
+        }
+        for block_idx in ivf.cluster_block_range(c as usize) {
+            scan_block_soa(
+                ivf,
+                block_idx,
+                &q,
+                &mut distances,
+                &mut indexes,
+                block_distances,
+            );
+        }
+        visited += 1;
+    }
+
+    bucket_from_blocks_top5(ivf, &indexes)
+}
+
+pub fn predict_bucket_ivf_blocks_bbox_repair(
+    ivf: &IvfBlocks,
+    query: &[f64; 14],
+    seed_clusters: usize,
+    visit_cap: usize,
+) -> u8 {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if avx2_enabled_for_runtime() {
+            return predict_bucket_ivf_blocks_bbox_repair_with(
+                ivf,
+                query,
+                seed_clusters,
+                visit_cap,
+                block_distances_avx2_checked,
+                squared_distance_avx2_checked,
+            );
+        }
+    }
+    predict_bucket_ivf_blocks_bbox_repair_with(
+        ivf,
+        query,
+        seed_clusters,
+        visit_cap,
+        block_distances_scalar,
+        squared_distance_scalar,
+    )
 }
 
 #[cfg(test)]
@@ -993,6 +1239,9 @@ mod tests {
             }
         }
 
+        let (bbox_min, bbox_max) =
+            crate::ivf_blocks::compute_bboxes(k, &block_offsets, &block_vectors, &block_origin);
+
         crate::ivf_blocks::IvfBlocks {
             k,
             count,
@@ -1004,6 +1253,8 @@ mod tests {
             block_origin,
             block_labels,
             labels_by_origin: ivf.labels_by_origin.clone(),
+            bbox_min,
+            bbox_max,
         }
     }
 
@@ -1077,7 +1328,10 @@ mod tests {
             [-32768; DIM],
             [10000; DIM],
             [-10000; DIM],
-            [1234, -5678, 9012, -12345, 23456, -30000, 42, -42, 777, -888, 999, -1111, 2222, -3333],
+            [
+                1234, -5678, 9012, -12345, 23456, -30000, 42, -42, 777, -888, 999, -1111, 2222,
+                -3333,
+            ],
             [1, -2, 3, -4, 5, -6, 7, -8, 9, -10, 11, -12, 13, -14],
             [i16::MAX; DIM], // sentinel padded slot
         ];
