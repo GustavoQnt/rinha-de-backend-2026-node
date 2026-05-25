@@ -21,7 +21,7 @@ ENV IVF_PATH=/app/resources/references.ivf.bin
 ENV IVF_BLOCKS_PATH=/app/resources/references.ivf-blocks-K4096.bin
 ENV IVF_NPROBE=64
 ENV IVF_BBOX_SEED=1
-ENV IVF_BBOX_VISIT_CAP=24
+ENV IVF_BBOX_VISIT_CAP=32
 ENV SOCK_PATH=/run/rinha/rinha.sock
 
 COPY --from=builder /build/native/rinha-server/target/release/rinha-server /app/rinha-server

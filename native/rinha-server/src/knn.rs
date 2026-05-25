@@ -31,14 +31,16 @@ use std::arch::x86::{
     __m128i, __m256i, _mm256_add_epi64, _mm256_castsi256_si128, _mm256_cvtepi16_epi32,
     _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_mul_epi32, _mm256_set1_epi32,
     _mm256_setzero_si256, _mm256_srli_epi64, _mm256_storeu_si256, _mm256_sub_epi32,
-    _mm_loadu_si128,
+    _mm_add_epi16, _mm_loadu_si128, _mm_madd_epi16, _mm_max_epi16, _mm_setzero_si128,
+    _mm_storeu_si128, _mm_subs_epi16,
 };
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::{
     __m128i, __m256i, _mm256_add_epi64, _mm256_castsi256_si128, _mm256_cvtepi16_epi32,
     _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_mul_epi32, _mm256_set1_epi32,
     _mm256_setzero_si256, _mm256_srli_epi64, _mm256_storeu_si256, _mm256_sub_epi32,
-    _mm_loadu_si128,
+    _mm_add_epi16, _mm_loadu_si128, _mm_madd_epi16, _mm_max_epi16, _mm_setzero_si128,
+    _mm_storeu_si128, _mm_subs_epi16,
 };
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -839,6 +841,81 @@ fn bbox_lower_bound_l2(bbox_min: &[i16], bbox_max: &[i16], q: &[i16; DIM], stop_
     sum
 }
 
+// AVX2 variant of `bbox_lower_bound_l2`: loads the first 8 dims of bbox/query
+// into an __m128i and computes the squared per-axis gaps in parallel. The
+// remaining 6 dims (DIM=14) go through a scalar tail.
+//
+// Math per lane (i16):
+//   gap = max(lo - q, 0) + max(q - hi, 0)        // exactly one of these is non-zero
+// Then `pmaddwd` computes a*c + b*d on adjacent i16 lanes and stores them as
+// i32s — perfect for summing squared distances. Worst-case lane value is
+// (2 * 32767)² which exceeds i16 range, so we use saturating subs and stay
+// within the legal i16 input domain of `pmaddwd`; the i32 accumulator absorbs
+// the products without overflow for our scale (≤ 5.6e9 across 14 dims).
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn bbox_lower_bound_l2_avx2(
+    bbox_min: &[i16],
+    bbox_max: &[i16],
+    q: &[i16; DIM],
+    stop_after: i64,
+) -> i64 {
+    let qv = _mm_loadu_si128(q.as_ptr() as *const __m128i);
+    let lov = _mm_loadu_si128(bbox_min.as_ptr() as *const __m128i);
+    let hiv = _mm_loadu_si128(bbox_max.as_ptr() as *const __m128i);
+
+    let zero = _mm_setzero_si128();
+    // Saturating subtractions clamp at i16 bounds; max-with-0 gives the
+    // positive gap only. At most one of (lov-qv) and (qv-hiv) is non-zero
+    // per lane (mutually exclusive — query is either left, inside, or right
+    // of the interval).
+    let gap_lo = _mm_max_epi16(_mm_subs_epi16(lov, qv), zero);
+    let gap_hi = _mm_max_epi16(_mm_subs_epi16(qv, hiv), zero);
+    let gap = _mm_add_epi16(gap_lo, gap_hi);
+
+    // pmaddwd: pairs of adjacent i16 lanes -> i32 sums of squares.
+    let sq = _mm_madd_epi16(gap, gap);
+    let mut lanes = [0i32; 4];
+    _mm_storeu_si128(lanes.as_mut_ptr() as *mut __m128i, sq);
+    let mut sum: i64 =
+        lanes[0] as i64 + lanes[1] as i64 + lanes[2] as i64 + lanes[3] as i64;
+
+    if sum > stop_after {
+        return sum;
+    }
+
+    // Tail dims 8..DIM scalar; only 6 iterations.
+    for d in 8..DIM {
+        let target = q[d] as i64;
+        let lo = bbox_min[d] as i64;
+        let hi = bbox_max[d] as i64;
+        let gap = if target < lo {
+            lo - target
+        } else if target > hi {
+            target - hi
+        } else {
+            0
+        };
+        sum += gap * gap;
+        if sum > stop_after {
+            return sum;
+        }
+    }
+    sum
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline]
+fn bbox_lower_bound_l2_avx2_checked(
+    bbox_min: &[i16],
+    bbox_max: &[i16],
+    q: &[i16; DIM],
+    stop_after: i64,
+) -> i64 {
+    debug_assert!(std::is_x86_feature_detected!("avx2"));
+    unsafe { bbox_lower_bound_l2_avx2(bbox_min, bbox_max, q, stop_after) }
+}
+
 // Closest N centroid indexes by squared L2, written into a fixed-size buffer.
 // Insertion sort over an [i64; N] beats a heap for small N (≤ 5).
 #[inline]
@@ -874,17 +951,19 @@ fn top_n_centroids_fixed_blocks<FC, const N: usize>(
 // safety margin without blowing L1d on the per-query stack frame.
 const BBOX_CAND_CAP: usize = 256;
 
-fn predict_bucket_ivf_blocks_bbox_repair_with<FB, FC>(
+fn predict_bucket_ivf_blocks_bbox_repair_with<FB, FC, FL>(
     ivf: &IvfBlocks,
     query: &[f64; 14],
     seed_clusters: usize,
     visit_cap: usize,
     block_distances: FB,
     centroid_distance: FC,
+    bbox_lb: FL,
 ) -> u8
 where
     FB: Fn(&[i16; DIM], &[i16]) -> [i64; BLOCK_SIZE] + Copy,
     FC: Fn(&[i16], &[i16]) -> i64 + Copy,
+    FL: Fn(&[i16], &[i16], &[i16; DIM], i64) -> i64 + Copy,
 {
     let q = quantize_query(query, ivf.scale);
     let mut distances = [i64::MAX; TOP_K];
@@ -934,7 +1013,7 @@ where
         // `stop_after` = current worst tells the LB to bail early if the
         // partial sum already exceeds the threshold — useful because
         // ~99% of clusters end up rejected here.
-        let lb = bbox_lower_bound_l2(
+        let lb = bbox_lb(
             ivf.bbox_min_for(c),
             ivf.bbox_max_for(c),
             &q,
@@ -1008,6 +1087,7 @@ pub fn predict_bucket_ivf_blocks_bbox_repair(
                 visit_cap,
                 block_distances_avx2_checked,
                 squared_distance_avx2_checked,
+                bbox_lower_bound_l2_avx2_checked,
             );
         }
     }
@@ -1018,6 +1098,7 @@ pub fn predict_bucket_ivf_blocks_bbox_repair(
         visit_cap,
         block_distances_scalar,
         squared_distance_scalar,
+        bbox_lower_bound_l2,
     )
 }
 
