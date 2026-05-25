@@ -868,6 +868,12 @@ fn top_n_centroids_fixed_blocks<FC, const N: usize>(
     }
 }
 
+// Upper limit on candidates kept between phase 2's filter and sort. After
+// the seed phase prunes `worst` aggressively, the typical query keeps fewer
+// than 30 candidates above the bbox-LB threshold. 256 is a comfortable
+// safety margin without blowing L1d on the per-query stack frame.
+const BBOX_CAND_CAP: usize = 256;
+
 fn predict_bucket_ivf_blocks_bbox_repair_with<FB, FC>(
     ivf: &IvfBlocks,
     query: &[f64; 14],
@@ -905,43 +911,72 @@ where
         }
     }
 
-    // Phase 2: enumerate remaining clusters in ascending bbox-LB order and
-    // scan each one whose bound is below the current worst-of-top-5. The
-    // total scan budget (seeds + bbox visits) is bounded by `visit_cap`.
+    // Phase 2: gather every non-seed cluster whose bbox-LB is below the
+    // current top-5 worst, then visit them in ascending-LB order. Each
+    // visit only shrinks `worst`, so the post-seed value is a safe upper
+    // bound to filter against — clusters dropped here would never beat
+    // the top-5 even after further refinement.
     //
-    // Building the candidate list costs K bbox-LB calls (~K early-exit ops).
-    // Sorting K=4096 by i64 is ~50us; cheap compared to a single cluster
-    // scan. We sort once instead of using a heap because over the prévia
-    // workload the average prune rate is high (>99%) but we still want a
-    // deterministic order before applying the cap.
-    let mut candidates: Vec<(i64, u32)> = Vec::with_capacity(ivf.k);
-    let seed_set: u128 = seed_slice
-        .iter()
-        .fold(0u128, |acc, &c| acc | (1u128 << (c % 128)));
+    // Stack-resident scratch: parallel arrays of (lb, cluster_id) sized
+    // for ~256 candidates. After the worst-of-top-5 filter, real queries
+    // sit at a few dozen entries, so insertion sort beats a generic
+    // sort_unstable: O(N²) with N≈20 is ~150 cycles vs ~30k for a 4096
+    // sort_unstable that the prior version paid every single query.
+    let mut cand_lb = [0i64; BBOX_CAND_CAP];
+    let mut cand_c = [0u32; BBOX_CAND_CAP];
+    let mut cand_n = 0usize;
+
+    let worst_after_seed = distances[TOP_K - 1];
     for c in 0..ivf.k {
-        // Skip the seeds we already scanned. The bitmap is sized for u128
-        // (covers up to 128 distinct seed positions modulo 128) — collisions
-        // just cause an extra membership check via the slice below.
-        if (seed_set >> (c % 128)) & 1 == 1 && seed_slice.contains(&(c as u32)) {
+        if seed_slice.iter().any(|&s| s as usize == c) {
             continue;
         }
-        // Use i64::MAX as `stop_after` since we still want the true bound
-        // for sorting; pruning by `worst` happens after sort.
-        let lb = bbox_lower_bound_l2(ivf.bbox_min_for(c), ivf.bbox_max_for(c), &q, i64::MAX);
-        candidates.push((lb, c as u32));
+        // `stop_after` = current worst tells the LB to bail early if the
+        // partial sum already exceeds the threshold — useful because
+        // ~99% of clusters end up rejected here.
+        let lb = bbox_lower_bound_l2(
+            ivf.bbox_min_for(c),
+            ivf.bbox_max_for(c),
+            &q,
+            worst_after_seed,
+        );
+        if lb >= worst_after_seed {
+            continue;
+        }
+        if cand_n < BBOX_CAND_CAP {
+            cand_lb[cand_n] = lb;
+            cand_c[cand_n] = c as u32;
+            cand_n += 1;
+        }
     }
-    candidates.sort_unstable_by_key(|&(lb, _)| lb);
+
+    // Insertion sort over the (typically small) filtered set. Stops as
+    // soon as the new key is already in order, so best-case is O(N) for
+    // an already-sorted input — common when seeds dominate proximity.
+    for i in 1..cand_n {
+        let key_lb = cand_lb[i];
+        let key_c = cand_c[i];
+        let mut j = i;
+        while j > 0 && cand_lb[j - 1] > key_lb {
+            cand_lb[j] = cand_lb[j - 1];
+            cand_c[j] = cand_c[j - 1];
+            j -= 1;
+        }
+        cand_lb[j] = key_lb;
+        cand_c[j] = key_c;
+    }
 
     let mut visited = seeds_n;
-    for (lb, c) in candidates {
+    for i in 0..cand_n {
         if visited >= visit_cap {
             break;
         }
         let worst = distances[TOP_K - 1];
-        if lb >= worst {
+        if cand_lb[i] >= worst {
             break;
         }
-        for block_idx in ivf.cluster_block_range(c as usize) {
+        let c = cand_c[i] as usize;
+        for block_idx in ivf.cluster_block_range(c) {
             scan_block_soa(
                 ivf,
                 block_idx,
