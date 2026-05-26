@@ -31,16 +31,16 @@ use std::arch::x86::{
     __m128i, __m256i, _mm256_add_epi64, _mm256_castsi256_si128, _mm256_cvtepi16_epi32,
     _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_mul_epi32, _mm256_set1_epi32,
     _mm256_setzero_si256, _mm256_srli_epi64, _mm256_storeu_si256, _mm256_sub_epi32,
-    _mm_add_epi16, _mm_loadu_si128, _mm_madd_epi16, _mm_max_epi16, _mm_prefetch,
-    _mm_setzero_si128, _mm_storeu_si128, _mm_subs_epi16, _MM_HINT_T0,
+    _mm_add_epi16, _mm_loadu_si128, _mm_madd_epi16, _mm_max_epi16, _mm_setzero_si128,
+    _mm_storeu_si128, _mm_subs_epi16,
 };
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::{
     __m128i, __m256i, _mm256_add_epi64, _mm256_castsi256_si128, _mm256_cvtepi16_epi32,
     _mm256_extracti128_si256, _mm256_loadu_si256, _mm256_mul_epi32, _mm256_set1_epi32,
     _mm256_setzero_si256, _mm256_srli_epi64, _mm256_storeu_si256, _mm256_sub_epi32,
-    _mm_add_epi16, _mm_loadu_si128, _mm_madd_epi16, _mm_max_epi16, _mm_prefetch,
-    _mm_setzero_si128, _mm_storeu_si128, _mm_subs_epi16, _MM_HINT_T0,
+    _mm_add_epi16, _mm_loadu_si128, _mm_madd_epi16, _mm_max_epi16, _mm_setzero_si128,
+    _mm_storeu_si128, _mm_subs_epi16,
 };
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -1006,27 +1006,7 @@ where
     let mut cand_n = 0usize;
 
     let worst_after_seed = distances[TOP_K - 1];
-    // Prefetch distance for bbox tables (i16 K×DIM, 14×2=28 bytes per row).
-    // With ~64B cache lines that's ~2 rows per line; a +8 lead is enough to
-    // arrive ahead of demand without hammering the L1.
-    const PF_AHEAD: usize = 8;
     for c in 0..ivf.k {
-        // Hint the cache lines for cluster c+PF_AHEAD before we hit them. We
-        // only prefetch when in-bounds; the trailing tail just gets demand
-        // loads, which is fine.
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        if c + PF_AHEAD < ivf.k {
-            unsafe {
-                _mm_prefetch(
-                    ivf.bbox_min_for(c + PF_AHEAD).as_ptr() as *const i8,
-                    _MM_HINT_T0,
-                );
-                _mm_prefetch(
-                    ivf.bbox_max_for(c + PF_AHEAD).as_ptr() as *const i8,
-                    _MM_HINT_T0,
-                );
-            }
-        }
         if seed_slice.iter().any(|&s| s as usize == c) {
             continue;
         }
@@ -1075,23 +1055,6 @@ where
             break;
         }
         let c = cand_c[i] as usize;
-        // Prefetch the next candidate cluster's first block while we scan
-        // the current one. Block_vectors are 112 i16 per block (~224B —
-        // 4 cache lines); hinting the first line of the upcoming block is
-        // enough for the prefetcher to stream the rest.
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        if i + 1 < cand_n {
-            let next_c = cand_c[i + 1] as usize;
-            let next_range = ivf.cluster_block_range(next_c);
-            if next_range.start < next_range.end {
-                unsafe {
-                    _mm_prefetch(
-                        ivf.block_payload(next_range.start).as_ptr() as *const i8,
-                        _MM_HINT_T0,
-                    );
-                }
-            }
-        }
         for block_idx in ivf.cluster_block_range(c) {
             scan_block_soa(
                 ivf,
