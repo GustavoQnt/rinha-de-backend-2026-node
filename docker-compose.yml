@@ -2,6 +2,7 @@ services:
   app1:
     image: ghcr.io/gustavoqnt/gustavoqntsrv:v5884
     hostname: app1
+    cpuset: "0"
     environment:
       IVF_BLOCKS_PATH: "/app/resources/references.ivf-blocks-K4096.bin"
       IVF_BBOX_SEED: "1"
@@ -25,6 +26,7 @@ services:
   app2:
     image: ghcr.io/gustavoqnt/gustavoqntsrv:v5884
     hostname: app2
+    cpuset: "1"
     environment:
       IVF_BLOCKS_PATH: "/app/resources/references.ivf-blocks-K4096.bin"
       IVF_BBOX_SEED: "1"
@@ -47,6 +49,7 @@ services:
 
   lb:
     image: ghcr.io/gustavoqnt/gustavoqntlb:v5884
+    cpuset: "2,3"
     environment:
       PORT: "9999"
       UPSTREAMS: "/run/rinha/api1.sock.ctrl,/run/rinha/api2.sock.ctrl"
