@@ -7,14 +7,11 @@ services:
       IVF_BBOX_SEED: "1"
       IVF_BBOX_VISIT_CAP: "32"
       SOCK_PATH: /run/rinha/rinha1.sock
-      USE_MONOIO: "1"
-      APP_WORKERS: "1"
+      APP_WORKERS: "2"
       RINHA_USE_AVX2: "1"
       MALLOC_ARENA_MAX: "1"
     volumes:
       - rinha-sock:/run/rinha
-    security_opt:
-      - seccomp=unconfined
     ulimits:
       memlock: -1
       nofile:
@@ -34,14 +31,11 @@ services:
       IVF_BBOX_SEED: "1"
       IVF_BBOX_VISIT_CAP: "32"
       SOCK_PATH: /run/rinha/rinha2.sock
-      USE_MONOIO: "1"
-      APP_WORKERS: "1"
+      APP_WORKERS: "2"
       RINHA_USE_AVX2: "1"
       MALLOC_ARENA_MAX: "1"
     volumes:
       - rinha-sock:/run/rinha
-    security_opt:
-      - seccomp=unconfined
     ulimits:
       memlock: -1
       nofile:
