@@ -1,6 +1,6 @@
 services:
   app1:
-    image: ghcr.io/gustavoqnt/gustavoqntsrv:v5884
+    image: ghcr.io/gustavoqnt/gustavoqntsrv:v5885
     hostname: app1
     environment:
       IVF_BLOCKS_PATH: "/app/resources/references.ivf-blocks-K4096.bin"
@@ -10,6 +10,7 @@ services:
       USE_SCM: "1"
       RINHA_USE_AVX2: "1"
       MALLOC_ARENA_MAX: "1"
+      SO_BUSY_POLL_US: "50"
     volumes:
       - rinha-sock:/run/rinha
     ulimits:
@@ -23,7 +24,7 @@ services:
           memory: "160MB"
 
   app2:
-    image: ghcr.io/gustavoqnt/gustavoqntsrv:v5884
+    image: ghcr.io/gustavoqnt/gustavoqntsrv:v5885
     hostname: app2
     environment:
       IVF_BLOCKS_PATH: "/app/resources/references.ivf-blocks-K4096.bin"
@@ -33,6 +34,7 @@ services:
       USE_SCM: "1"
       RINHA_USE_AVX2: "1"
       MALLOC_ARENA_MAX: "1"
+      SO_BUSY_POLL_US: "50"
     volumes:
       - rinha-sock:/run/rinha
     ulimits:
