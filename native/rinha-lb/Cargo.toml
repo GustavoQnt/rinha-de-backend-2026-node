@@ -8,9 +8,8 @@ name = "rinha-lb"
 path = "src/main.rs"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-monoio = { version = "0.2", default-features = false, features = ["iouring"] }
 libc = "0.2"
-socket2 = "0.5"
+socket2 = { version = "0.5", features = ["all"] }
 
 [profile.release]
 lto = "fat"

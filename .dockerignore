@@ -1,5 +1,7 @@
 .git
 node_modules
+native/rinha-lb/target
+native/rinha-server/target
 test
 docs
 resources/*

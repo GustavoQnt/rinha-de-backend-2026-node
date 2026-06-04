@@ -407,6 +407,14 @@ fn main() {
     }
 
     #[cfg(target_os = "linux")]
+    if env::var("USE_SCM_EPOLL").as_deref() == Ok("1") {
+        let sock = env::var("SOCK_PATH").expect("SOCK_PATH required for USE_SCM_EPOLL=1");
+        eprintln!("server backend = direct epoll + SCM_RIGHTS");
+        rinha_server::scm_epoll_server::serve_scm_epoll(sock, index, responses);
+        return;
+    }
+
+    #[cfg(target_os = "linux")]
     if env::var("USE_SCM").as_deref() == Ok("1") {
         let sock = env::var("SOCK_PATH").expect("SOCK_PATH required for USE_SCM=1");
         eprintln!("server backend = monoio + SCM_RIGHTS (io_uring)");

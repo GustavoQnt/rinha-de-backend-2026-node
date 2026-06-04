@@ -14,6 +14,7 @@ test/test-data.*.ndjson
 temporary-results
 native/knn-addon/target/
 native/knn-addon/knn_native.node
+native/rinha-lb/target/
 native/rinha-server/target/
 logs/
 resources/*.bin

@@ -2,7 +2,7 @@ FROM rust:1.86-slim-bookworm AS builder
 
 WORKDIR /build
 
-COPY native/rinha-lb/Cargo.toml ./native/rinha-lb/
+COPY native/rinha-lb/Cargo.toml native/rinha-lb/Cargo.lock ./native/rinha-lb/
 COPY native/rinha-lb/.cargo ./native/rinha-lb/.cargo
 COPY native/rinha-lb/src ./native/rinha-lb/src
 
