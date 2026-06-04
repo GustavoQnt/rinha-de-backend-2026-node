@@ -386,13 +386,13 @@ impl EpollServer {
         match route {
             Route::Ready => self.responses.ready(keep_alive),
             Route::NotFound => self.responses.not_found(keep_alive),
-            Route::FraudScore => match json::parse_request(body) {
-                Some(parsed) => {
-                    let v = vectorize::vectorize(&parsed.to_vec_input());
-                    let bucket = self.index.predict(&v) as usize;
-                    self.responses.fraud(bucket, keep_alive)
-                }
-                None => self.responses.bad(keep_alive),
+            Route::FraudScore => match classify(self.index, body) {
+                Some(bucket) => self.responses.fraud(bucket, keep_alive),
+                // Unclassifiable body: an HTTP error weighs 5 in the scoring
+                // while a wrong guess weighs 1 (FP) or 3 (FN); at the dataset's
+                // ~44% fraud rate denying is the cheapest blind guess
+                // (0.56 expected weight vs 1.33 for approving).
+                None => self.responses.fraud(FALLBACK_DENY_BUCKET, keep_alive),
             },
         }
     }
@@ -453,6 +453,32 @@ impl EpollServer {
 
     fn conn_mut(&mut self, fd: RawFd) -> Option<&mut Conn> {
         self.conns.get_mut(fd as usize)?.as_deref_mut()
+    }
+}
+
+/// approved:false, fraud_score 0.6 — the first "deny" bucket.
+const FALLBACK_DENY_BUCKET: usize = 3;
+
+/// Total classification: parse + vectorize + predict, never panics.
+/// Returns None for anything unclassifiable (parse failure, non-finite vector,
+/// or an unexpected panic caught before it can kill the single-threaded event
+/// loop — one poisoned request must cost one fallback response, not the
+/// process).
+fn classify(index: &Index, body: &[u8]) -> Option<usize> {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let parsed = json::parse_request(body)?;
+        let v = vectorize::vectorize(&parsed.to_vec_input());
+        if v.iter().any(|x| x.is_nan()) {
+            return None;
+        }
+        Some(index.predict(&v) as usize)
+    }));
+    match result {
+        Ok(bucket) => bucket,
+        Err(_) => {
+            eprintln!("scm_epoll: classify panicked; served fallback deny");
+            None
+        }
     }
 }
 

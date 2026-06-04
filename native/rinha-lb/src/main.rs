@@ -27,14 +27,16 @@ fn main() {
         let port = cfg.port;
         let backlog = cfg.backlog;
         handles.push(std::thread::spawn(move || {
-            let ctrl_fds: Vec<libc::c_int> =
-                upstreams.iter().map(|p| scm::connect_ctrl(p)).collect();
+            let ups: Vec<accept::Upstream> = upstreams
+                .iter()
+                .map(|p| accept::Upstream::new(p.to_string(), scm::connect_ctrl(p)))
+                .collect();
             eprintln!(
                 "rinha-lb worker {worker_id} connected to {} ctrl fds",
-                ctrl_fds.len()
+                ups.len()
             );
 
-            accept::accept_loop(port, backlog, ctrl_fds);
+            accept::accept_loop(port, backlog, ups);
         }));
     }
     for h in handles {

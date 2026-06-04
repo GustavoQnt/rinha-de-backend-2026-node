@@ -373,6 +373,10 @@ fn parse_last_tx<'a>(cur: &mut Cursor<'a>, out: &mut ParsedRequest<'a>) -> Optio
     Some(())
 }
 
+// vectorize() slices the tx timestamp up to [17..19]; anything shorter than the
+// full "YYYY-MM-DDTHH:MM:SS" prefix would panic the event loop.
+const MIN_TS_LEN: usize = 19;
+
 pub fn parse_request(body: &[u8]) -> Option<ParsedRequest<'_>> {
     let mut cur = Cursor::new(body);
     let mut out = ParsedRequest {
@@ -415,6 +419,18 @@ pub fn parse_request(body: &[u8]) -> Option<ParsedRequest<'_>> {
             b"last_transaction" => parse_last_tx(&mut cur, &mut out)?,
             _ => cur.skip_value(),
         }
+    }
+
+    // Robustness gates (see MIN_TS_LEN): a malformed/missing tx timestamp makes
+    // the request unclassifiable -> None (caller answers with a fallback guess).
+    // A malformed last_tx timestamp only degrades to the null-last_tx sentinels,
+    // so the remaining fields still drive a real prediction.
+    if out.tx_requested_at.len() < MIN_TS_LEN {
+        return None;
+    }
+    if matches!(out.last_tx_timestamp, Some(ts) if ts.len() < MIN_TS_LEN) {
+        out.last_tx_timestamp = None;
+        out.last_tx_km_from_current = None;
     }
 
     Some(out)
@@ -465,5 +481,53 @@ mod tests {
         assert_eq!(req.tx_amount, 384.88);
         assert_eq!(req.last_tx_timestamp, Some(&b"2026-03-11T14:58:35Z"[..]));
         assert!((req.last_tx_km_from_current.unwrap() - 18.8626479774).abs() < 1e-9);
+    }
+
+    // Robustness gates: vectorize slices the timestamps ([0..4], [11..13],
+    // [17..19]); any request whose tx timestamp is shorter than the full
+    // "YYYY-MM-DDTHH:MM:SSZ" prefix must be rejected here (None) instead of
+    // panicking the event loop.
+
+    #[test]
+    fn empty_body_returns_none() {
+        assert!(parse_request(b"").is_none());
+    }
+
+    #[test]
+    fn empty_json_returns_none() {
+        assert!(parse_request(b"{}").is_none());
+    }
+
+    #[test]
+    fn truncated_json_returns_none() {
+        assert!(parse_request(b"{").is_none());
+    }
+
+    #[test]
+    fn short_tx_timestamp_returns_none() {
+        let body =
+            br#"{"transaction": {"amount": 1.0, "installments": 1, "requested_at": "2026-03"}}"#;
+        assert!(parse_request(body).is_none());
+    }
+
+    #[test]
+    fn short_last_tx_timestamp_degrades_to_sentinels() {
+        let body = br#"{
+            "transaction": {"amount": 41.12, "installments": 2, "requested_at": "2026-03-11T18:45:53Z"},
+            "customer": {"avg_amount": 82.24, "tx_count_24h": 3, "known_merchants": []},
+            "merchant": {"id": "MERC-016", "mcc": "5411", "avg_amount": 60.25},
+            "terminal": {"is_online": false, "card_present": true, "km_from_home": 29.2},
+            "last_transaction": {"timestamp": "2026-03", "km_from_current": 18.8}
+        }"#;
+        let req = parse_request(body).expect("must still parse");
+        assert!(
+            req.last_tx_timestamp.is_none(),
+            "short last_tx ts must degrade"
+        );
+        assert!(
+            req.last_tx_km_from_current.is_none(),
+            "km must degrade with it"
+        );
+        assert_eq!(req.tx_amount, 41.12, "other fields keep parsing");
     }
 }

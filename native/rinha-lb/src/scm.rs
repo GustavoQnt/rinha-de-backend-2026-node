@@ -28,6 +28,18 @@ pub struct ScmSender {
     cmsg_buf: CmsgBuffer,
 }
 
+// Owns the ctrl fd: closing on drop lets a reconnect replace a dead sender
+// without leaking the old descriptor.
+impl Drop for ScmSender {
+    fn drop(&mut self) {
+        if self.ctrl >= 0 {
+            unsafe {
+                libc::close(self.ctrl);
+            }
+        }
+    }
+}
+
 impl ScmSender {
     pub fn new(ctrl: libc::c_int) -> Self {
         Self {
