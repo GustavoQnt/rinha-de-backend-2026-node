@@ -1,6 +1,7 @@
 services:
   app1:
-    image: ghcr.io/gustavoqnt/gustavoqntsrv:v5887
+    restart: always
+    image: ghcr.io/gustavoqnt/gustavoqntsrv:v5888
     hostname: app1
     cpuset: "0"
     environment:
@@ -25,7 +26,8 @@ services:
           memory: "160MB"
 
   app2:
-    image: ghcr.io/gustavoqnt/gustavoqntsrv:v5887
+    restart: always
+    image: ghcr.io/gustavoqnt/gustavoqntsrv:v5888
     hostname: app2
     cpuset: "1"
     environment:
@@ -50,7 +52,8 @@ services:
           memory: "160MB"
 
   lb:
-    image: ghcr.io/gustavoqnt/gustavoqntlb:v5887
+    restart: always
+    image: ghcr.io/gustavoqnt/gustavoqntlb:v5888
     cpuset: "2,3"
     environment:
       PORT: "9999"
