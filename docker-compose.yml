@@ -1,13 +1,15 @@
 services:
   app1:
-    image: ghcr.io/gustavoqnt/gustavoqntsrv:v5884
+    image: ghcr.io/gustavoqnt/gustavoqntsrv:v5887
     hostname: app1
+    cpuset: "0"
     environment:
       IVF_BLOCKS_PATH: "/app/resources/references.ivf-blocks-K4096.bin"
       IVF_BBOX_SEED: "1"
       IVF_BBOX_VISIT_CAP: "32"
       SOCK_PATH: /run/rinha/api1.sock
-      USE_SCM: "1"
+      USE_SCM_EPOLL: "1"
+      EPOLL_IDLE_US: "40"
       RINHA_USE_AVX2: "1"
       MALLOC_ARENA_MAX: "1"
     volumes:
@@ -19,18 +21,20 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.40"
+          cpus: "0.475"
           memory: "160MB"
 
   app2:
-    image: ghcr.io/gustavoqnt/gustavoqntsrv:v5884
+    image: ghcr.io/gustavoqnt/gustavoqntsrv:v5887
     hostname: app2
+    cpuset: "1"
     environment:
       IVF_BLOCKS_PATH: "/app/resources/references.ivf-blocks-K4096.bin"
       IVF_BBOX_SEED: "1"
       IVF_BBOX_VISIT_CAP: "32"
       SOCK_PATH: /run/rinha/api2.sock
-      USE_SCM: "1"
+      USE_SCM_EPOLL: "1"
+      EPOLL_IDLE_US: "40"
       RINHA_USE_AVX2: "1"
       MALLOC_ARENA_MAX: "1"
     volumes:
@@ -42,11 +46,12 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.40"
+          cpus: "0.475"
           memory: "160MB"
 
   lb:
-    image: ghcr.io/gustavoqnt/gustavoqntlb:v5884
+    image: ghcr.io/gustavoqnt/gustavoqntlb:v5887
+    cpuset: "2,3"
     environment:
       PORT: "9999"
       UPSTREAMS: "/run/rinha/api1.sock.ctrl,/run/rinha/api2.sock.ctrl"
@@ -66,7 +71,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.20"
+          cpus: "0.05"
           memory: "30MB"
 
 volumes:
