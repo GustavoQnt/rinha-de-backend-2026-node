@@ -36,7 +36,10 @@ pub fn serve_scm_epoll(sock_path: String, index: Arc<Index>, responses: Arc<Resp
     .unwrap_or_else(|err| panic!("epoll add ctrl listener: {err}"));
     configure_epoll_busy_poll(epfd);
 
-    eprintln!("scm_epoll: ctrl socket bound at {ctrl_path}");
+    eprintln!(
+        "scm_epoll: ctrl socket bound at {ctrl_path} (EPOLL_IDLE_US={}, 0 = block)",
+        env_u32("EPOLL_IDLE_US", 0)
+    );
 
     let mut server = EpollServer::new(epfd, listener_fd, index, responses);
     server.run();
@@ -131,15 +134,9 @@ impl EpollServer {
 
     fn run(&mut self) {
         let mut events = [libc::epoll_event { events: 0, u64: 0 }; MAX_EVENTS];
+        let mut idle = IdleWait::from_env();
         loop {
-            let n = unsafe {
-                libc::epoll_wait(
-                    self.epfd,
-                    events.as_mut_ptr(),
-                    MAX_EVENTS as libc::c_int,
-                    -1,
-                )
-            };
+            let n = wait_events(self.epfd, &mut events, &mut idle);
             if n < 0 {
                 let err = io::Error::last_os_error();
                 if err.raw_os_error() == Some(libc::EINTR) {
@@ -668,6 +665,73 @@ fn epoll_del(epfd: RawFd, fd: RawFd) {
     }
 }
 
+/// Idle-wait tuning for the event loop.
+///
+/// With `EPOLL_IDLE_US > 0` the loop never blocks indefinitely: it waits with a
+/// microsecond timeout (`epoll_pwait2`), so the worker keeps waking even when no
+/// request is in flight. On the mostly-idle stretches of the load ramp this keeps
+/// the pinned core out of deep C-states and the wake-up path warm, at a duty
+/// cycle far below the container CPU quota. `EPOLL_IDLE_US=0` (default) keeps
+/// the previous behavior of blocking until an event arrives.
+struct IdleWait {
+    timeout: Option<libc::timespec>,
+    fallback_ms: libc::c_int,
+    pwait2_usable: bool,
+}
+
+impl IdleWait {
+    fn from_env() -> Self {
+        Self::for_micros(env_u32("EPOLL_IDLE_US", 0) as u64)
+    }
+
+    fn for_micros(idle_us: u64) -> Self {
+        let timeout = (idle_us > 0).then(|| libc::timespec {
+            tv_sec: (idle_us / 1_000_000) as libc::time_t,
+            tv_nsec: ((idle_us % 1_000_000) * 1_000) as libc::c_long,
+        });
+        Self {
+            timeout,
+            fallback_ms: ((idle_us + 999) / 1_000).max(1) as libc::c_int,
+            pwait2_usable: true,
+        }
+    }
+}
+
+/// Waits for epoll events honoring the idle tuning. Returns the raw
+/// `epoll_wait`/`epoll_pwait2` result; callers keep handling `n < 0` (EINTR).
+fn wait_events(epfd: RawFd, events: &mut [libc::epoll_event], idle: &mut IdleWait) -> libc::c_int {
+    let max_events = events.len() as libc::c_int;
+    let Some(timeout) = idle.timeout else {
+        return unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), max_events, -1) };
+    };
+    if idle.pwait2_usable {
+        let n = unsafe {
+            libc::epoll_pwait2(
+                epfd,
+                events.as_mut_ptr(),
+                max_events,
+                &timeout,
+                std::ptr::null(),
+            )
+        };
+        if n >= 0 {
+            return n;
+        }
+        let code = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        if code != libc::ENOSYS && code != libc::EPERM {
+            return n;
+        }
+        // Kernel too old (ENOSYS) or syscall filtered by seccomp (EPERM):
+        // fall back to a millisecond timeout for good.
+        idle.pwait2_usable = false;
+        eprintln!(
+            "scm_epoll: epoll_pwait2 unavailable (errno {code}); using epoll_wait({} ms)",
+            idle.fallback_ms
+        );
+    }
+    unsafe { libc::epoll_wait(epfd, events.as_mut_ptr(), max_events, idle.fallback_ms) }
+}
+
 fn set_nonblocking(fd: RawFd) -> io::Result<()> {
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFL);
@@ -839,4 +903,106 @@ fn env_u32(name: &str, default: u32) -> u32 {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn new_epoll() -> RawFd {
+        let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+        assert!(epfd >= 0, "epoll_create1: {}", io::Error::last_os_error());
+        epfd
+    }
+
+    fn close_fd(fd: RawFd) {
+        unsafe {
+            libc::close(fd);
+        }
+    }
+
+    fn socketpair_with_ready_byte(epfd: RawFd) -> [RawFd; 2] {
+        let mut fds = [0 as RawFd; 2];
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+        assert_eq!(rc, 0, "socketpair: {}", io::Error::last_os_error());
+        epoll_add(epfd, fds[0], fds[0] as u64, libc::EPOLLIN).expect("epoll add socketpair");
+        let byte = [1u8];
+        let sent = unsafe { libc::send(fds[1], byte.as_ptr().cast(), 1, 0) };
+        assert_eq!(sent, 1, "send: {}", io::Error::last_os_error());
+        fds
+    }
+
+    #[test]
+    fn idle_timeout_returns_zero_events_instead_of_blocking() {
+        let epfd = new_epoll();
+        let mut events = [libc::epoll_event { events: 0, u64: 0 }; 8];
+        let mut idle = IdleWait::for_micros(20_000);
+        let start = Instant::now();
+        let n = wait_events(epfd, &mut events, &mut idle);
+        let elapsed = start.elapsed();
+        close_fd(epfd);
+        assert_eq!(n, 0, "expected timeout with no events");
+        assert!(
+            elapsed >= Duration::from_millis(10),
+            "returned too early: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "took too long: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn ready_event_returns_immediately_with_idle_timeout() {
+        let epfd = new_epoll();
+        let fds = socketpair_with_ready_byte(epfd);
+        let mut events = [libc::epoll_event { events: 0, u64: 0 }; 8];
+        let mut idle = IdleWait::for_micros(1_000_000);
+        let start = Instant::now();
+        let n = wait_events(epfd, &mut events, &mut idle);
+        let elapsed = start.elapsed();
+        close_fd(fds[0]);
+        close_fd(fds[1]);
+        close_fd(epfd);
+        assert_eq!(n, 1, "expected the ready event");
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "ready event should not wait for the idle timeout: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn ms_fallback_times_out_when_pwait2_unusable() {
+        let epfd = new_epoll();
+        let mut events = [libc::epoll_event { events: 0, u64: 0 }; 8];
+        let mut idle = IdleWait::for_micros(20_000);
+        idle.pwait2_usable = false;
+        let start = Instant::now();
+        let n = wait_events(epfd, &mut events, &mut idle);
+        let elapsed = start.elapsed();
+        close_fd(epfd);
+        assert_eq!(n, 0, "expected timeout with no events");
+        assert!(
+            elapsed >= Duration::from_millis(10),
+            "returned too early: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "took too long: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn zero_idle_blocks_until_event() {
+        let epfd = new_epoll();
+        let fds = socketpair_with_ready_byte(epfd);
+        let mut events = [libc::epoll_event { events: 0, u64: 0 }; 8];
+        let mut idle = IdleWait::for_micros(0);
+        let n = wait_events(epfd, &mut events, &mut idle);
+        close_fd(fds[0]);
+        close_fd(fds[1]);
+        close_fd(epfd);
+        assert_eq!(n, 1, "expected the ready event from the blocking branch");
+    }
 }

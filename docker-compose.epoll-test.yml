@@ -11,6 +11,7 @@ services:
       IVF_BBOX_VISIT_CAP: "32"
       SOCK_PATH: /run/rinha/api1.sock
       USE_SCM_EPOLL: "1"
+      EPOLL_IDLE_US: "40"
       RINHA_USE_AVX2: "1"
       MALLOC_ARENA_MAX: "1"
     volumes:
@@ -37,6 +38,7 @@ services:
       IVF_BBOX_VISIT_CAP: "32"
       SOCK_PATH: /run/rinha/api2.sock
       USE_SCM_EPOLL: "1"
+      EPOLL_IDLE_US: "40"
       RINHA_USE_AVX2: "1"
       MALLOC_ARENA_MAX: "1"
     volumes:
